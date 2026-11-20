@@ -1,0 +1,2 @@
+# Keep LF everywhere: patches, scripts and the Dockerfile run on Linux.
+* text=auto eol=lf
