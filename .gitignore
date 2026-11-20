@@ -1,0 +1,21 @@
+# Local run output
+output.jsonl
+*.jsonl
+
+# Python
+__pycache__/
+*.pyc
+.venv/
+venv/
+
+# Map-building workspace (the sqlglot checkout, raw coverage data).
+# Only the final compressed map in maps/ gets committed.
+work/
+.coverage*
+htmlcov/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
