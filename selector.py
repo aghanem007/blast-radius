@@ -1104,8 +1104,11 @@ def main() -> None:
         except Exception as e:  # never a miss: without it every candidate is kept
             log(f"early cutoff unavailable ({e!r})")
 
+    diag = Diagnostic(early) if DIAG else None
     for patch in sorted((DATA / "commits").glob("*.patch")):
         log(f"{patch.stem}:")
+        if diag is not None:
+            diag.start_commit()
         chosen: set[int] | None = ALL
         if selector is not None:
             try:
@@ -1131,8 +1134,145 @@ def main() -> None:
                     log(f"  early cutoff error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
+        if diag is not None:
+            diag.end_commit(patch.stem, numbers, workers, chosen is ALL, ms)
+            continue
         answers.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
         answers.flush()
+    if diag is not None:
+        diag.finish(answers, ms)
+
+
+# --------------------------------------------------------------------- diagnostic
+#
+# DIAGNOSTIC BUILD (branch diag/telemetry-1). NOT a candidate for the final.
+#
+# We never see what the program prints on the practice set, only three numbers per run:
+# simulated seconds, CPU seconds, commits missed. This build makes exactly the same
+# selections as commit 38923fa (which scored 215.778 s simulated on practice) and reports
+# how OUR OWN selector behaved there, through those numbers:
+#
+#   kinds of commit, by the rule that decided the selection (highest wins):
+#     all       fell back to "run every test"
+#     class     import-time code in sqlglot: class-level statements, module constants, def headers
+#     runtime   statements inside function bodies
+#     (the rest: test files, fixtures and other data files, docstrings, no-ops)
+#
+#   simulated seconds: one commit whose selection is empty (cost 0) is given extra tests
+#     on one worker, with a total duration that encodes
+#       P = round(cost of "all" commits, s) * 216 + round(cost of "class" commits, s)
+#           + 46656 if the early cutoff would have run at least one check
+#     as a load of P + 1000 ms. Adding tests can never cause a miss.
+#       decode: P = (simulated - 215.778 - 2.000) * 1000 - 1000
+#   CPU seconds: the program burns CPU until its own total reaches
+#       5 + 15 * flags + (cost of "runtime" commits, s) / 20
+#     flags = 1 if the early cutoff is usable here (stage map and baseline load)
+#           + 2 if a commit with an empty selection was found to carry P
+#
+# It uses no labels and learns nothing about which tests fail: every number is a
+# count or a cost of selections this program made itself.
+DIAG = os.environ.get("BR_DIAG", "1") == "1"
+
+
+class Diagnostic:
+    KIND_PATTERNS = (
+        ("all", ("-> all",)),
+        ("class", ("class-level in", "attribute [", "module constant", "def header", "registry attribute")),
+        ("runtime", ("runtime statement",)),
+    )
+
+    def __init__(self, early) -> None:
+        self.early = early
+        self.would_check = 0
+        self.messages: list[str] = []
+        self.rows: list[tuple[str, list, list, str]] = []  # commit, numbers, workers, kind
+        original = log
+
+        def recording_log(*args) -> None:
+            self.messages.append(" ".join(str(a) for a in args))
+            original(*args)
+
+        globals()["log"] = recording_log
+        if early is not None:
+            def no_check(*args, **kwargs) -> bool:  # count it, never run it: selections stay as in 38923fa
+                self.would_check += 1
+                return False
+
+            early.mod.run_check = no_check
+
+    def start_commit(self) -> None:
+        self.messages.clear()
+
+    def end_commit(self, commit: str, numbers: list, workers: list, is_all: bool, ms: dict) -> None:
+        text = "\n".join(self.messages)
+        kind = "other"
+        if is_all:
+            kind = "all"
+        else:
+            for name, needles in self.KIND_PATTERNS:
+                if any(n in text for n in needles):
+                    kind = name
+                    break
+        self.rows.append((commit, numbers, workers, kind))
+
+    def payload_tests(self, load_ms: int, ms: dict) -> list | None:
+        """Tests whose durations add up to exactly load_ms (subset sum over a bitset)."""
+        items = sorted((n, d) for n, d in ms.items() if d > 0)
+        mask = (1 << (load_ms + 1)) - 1
+        reach = [1]
+        for _, d in items:
+            reach.append((reach[-1] | (reach[-1] << d)) & mask)
+        if not (reach[-1] >> load_ms) & 1:
+            return None
+        chosen, left = [], load_ms
+        for i in range(len(items) - 1, -1, -1):
+            if (reach[i] >> left) & 1:
+                continue  # reachable without this test
+            chosen.append(items[i][0])
+            left -= items[i][1]
+        return sorted(chosen) if left == 0 else None
+
+    def finish(self, answers, ms: dict) -> None:
+        import time
+
+        cost = {"all": 0, "class": 0, "runtime": 0, "other": 0}
+        count = dict.fromkeys(cost, 0)
+        for _, numbers, _, kind in self.rows:
+            cost[kind] += commit_cost_ms(numbers, ms)
+            count[kind] += 1
+        alive = False
+        try:
+            alive = self.early is not None and self.early.baseline() is not None
+        except Exception as e:  # noqa: BLE001
+            log(f"diagnostic: early cutoff not usable ({e!r})")
+        n1 = min(215, round(cost["all"] / 1000))
+        n2 = min(215, round(cost["class"] / 1000))
+        p = n1 * 216 + n2 + (46656 if self.would_check else 0)
+        carrier, extra = None, None
+        for i, (_, numbers, _, _) in enumerate(self.rows):
+            if not numbers:
+                extra = self.payload_tests(p + 1000, ms)
+                carrier = i if extra is not None else None
+                break
+        flags = (1 if alive else 0) + (2 if carrier is not None else 0)
+        target_cpu = 5.0 + 15.0 * flags + cost["runtime"] / 1000 / 20
+        log(
+            "diagnostic: " + json.dumps({
+                "cost_s": {k: v / 1000 for k, v in cost.items()}, "count": count, "would_check": self.would_check,
+                "alive": alive, "carrier": None if carrier is None else self.rows[carrier][0],
+                "P": p, "flags": flags, "target_cpu_s": round(target_cpu, 3),
+                "expected_extra_simulated_s": 0 if carrier is None else (p + 1000 + 2000) / 1000,
+            })
+        )
+        for i, (commit, _, workers, _) in enumerate(self.rows):
+            if i == carrier:
+                workers = [extra]
+            answers.write(json.dumps({"commit": commit, "workers": workers}) + "\n")
+        answers.flush()
+        x = 0
+        while time.process_time() < target_cpu:
+            for _ in range(20000):
+                x += 1
 
 
 if __name__ == "__main__":
