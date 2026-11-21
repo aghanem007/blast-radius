@@ -422,6 +422,11 @@ class BackHalf:
         return self.fingerprinter.digest((tuple(result.columns), result.rows))
 
 
+class _TooSlow(BaseException):
+    """Raised by the CPU timer in cmd_check. Not an Exception, so patched code that
+    catches Exception cannot swallow it."""
+
+
 class _Plans:
     def __init__(self) -> None:
         self.plans: dict = {}
@@ -501,25 +506,89 @@ def cmd_check(src: str, base_path: str, job_path: str) -> int:
         queries = {int(q) for q in job.get("queries", ())}
         only = None if job.get("front", True) else queries
         max_diffs, diff_budget = int(job.get("max_plan_diffs", 0)), float(job.get("plan_diff_cpu_s", 0))
+        back_scale = float(job.get("back_scale", 1.0))
         if (queries or max_diffs) and not back_cpu:
             raise RuntimeError("baseline has no back-half results")
         first_diff: list = []
         plan_diffs: list[int] = []
-        hooks = _Plans()
+        executed: list[int] = []
+        state: dict = {"back": None}
+
+        # A patch can make the front half, or one query, run very long or forever. Such
+        # a run is "different" as soon as it is clearly over what the pinned commit
+        # takes: the front half and each executed query get 1 s + three times their
+        # usual CPU. (The process-wide limit above stays as a backstop.)
+        import signal
+
+        timer = getattr(signal, "ITIMER_VIRTUAL", None) if hasattr(signal, "setitimer") else None
+        front_allow = job.get("front_cpu_s")
+        watch = {"left": (1.0 + 3.0 * float(front_allow)) if front_allow else None, "since": time.process_time()}
+
+        def arm(seconds) -> None:
+            if timer is not None:
+                # repeating: if some `except` in the patched code swallows the first one
+                signal.setitimer(timer, max(float(seconds), 0.05), 0.5) if seconds is not None else signal.setitimer(timer, 0)
+
+        if timer is not None:
+            def too_slow(signum, frame):
+                raise _TooSlow("over its CPU allowance")
+
+            signal.signal(signal.SIGVTALRM, too_slow)
+            arm(watch["left"])
 
         def on_item(key: str, value: str) -> None:
             if base.get(key) == value:
                 return
             number, kind = key.split(".")
             if kind == "plan" and not value.startswith("!") and len(plan_diffs) < max_diffs:
-                spent = sum(back_cpu.get(str(q), 99.0) for q in plan_diffs) + back_cpu.get(number, 99.0)
+                # in the caller's reference seconds (see selector.EarlyCut.baseline)
+                spent = back_scale * (sum(back_cpu.get(str(q), 99.0) for q in plan_diffs) + back_cpu.get(number, 99.0))
                 if spent <= diff_budget:
-                    plan_diffs.append(int(number))  # decided by executing it, below
+                    plan_diffs.append(int(number))  # decided by executing it, right after
                     return
             first_diff.append((key, value[:120] if value.startswith("!") else "differs"))
             raise StopIteration
 
-        items = front_half(src, on_item=on_item, hooks=hooks, only=only, fixture_text=job.get("fixture_text"))
+        class _Execute:
+            """Called for every executed query as soon as its plan exists. A query whose
+            back half the patch can reach, or whose plan changed, is executed at once and
+            its result compared: the first different result ends the whole check, so a
+            patch that really changes an answer costs little."""
+
+            def back(self, i, names, plan) -> None:
+                if i not in queries and i not in plan_diffs:
+                    return
+                if f"{i}.result" not in base:
+                    first_diff.append((f"{i}.result", "no baseline result"))
+                    raise StopIteration
+                # stop the front half's clock, run this query on its own allowance
+                now = time.process_time()
+                if watch["left"] is not None:
+                    watch["left"] -= now - watch["since"]
+                arm(None)
+                try:
+                    if state["back"] is None:
+                        state["back"] = BackHalf(src)
+                    for name in names:
+                        state["back"].table(name)  # loading a fixture table is not the query's time
+                    arm(1.0 + 3.0 * float(back_cpu.get(str(i), 1.0)))
+                    got = state["back"].run(names, plan)
+                except BaseException as e:  # noqa: BLE001 - an exception is an outcome too
+                    got = f"!{type(e).__name__}: {e}"[:300]
+                finally:
+                    arm(None)
+                executed.append(i)
+                watch["since"] = time.process_time()
+                arm(watch["left"])
+                if got != base[f"{i}.result"]:
+                    first_diff.append((f"{i}.result", got[:120] if got.startswith("!") else "differs"))
+                    raise StopIteration
+
+        hooks = _Execute()
+        try:
+            items = front_half(src, on_item=on_item, hooks=hooks, only=only, fixture_text=job.get("fixture_text"))
+        finally:
+            arm(None)
         expected = [
             k for k in base
             if not k.endswith(".result") and (only is None or int(k.split(".")[0]) in only)
@@ -530,24 +599,17 @@ def cmd_check(src: str, base_path: str, job_path: str) -> int:
         elif missing:
             verdict = {"same": False, "why": f"{len(missing)} fingerprints missing, first {missing[0]}"}
         else:
-            verdict = {"same": True}
-            todo = sorted(queries | set(plan_diffs))
-            if todo:
-                back = BackHalf(src)
-                for q in todo:
-                    if q not in hooks.plans or f"{q}.result" not in base:
-                        verdict = {"same": False, "why": f"{q}: no plan or no baseline result"}
-                        break
-                    try:
-                        got = back.run(*hooks.plans[q])
-                    except BaseException as e:  # noqa: BLE001
-                        got = f"!{type(e).__name__}: {e}"[:300]
-                    if got != base[f"{q}.result"]:
-                        verdict = {"same": False, "why": f"{q}.result: " + (got[:120] if got.startswith("!") else "differs")}
-                        break
-                verdict["executed"] = len(todo)
-            if plan_diffs:
-                verdict["plan_diffs"] = plan_diffs
+            # Every query that had to be executed must have been: one that never got a
+            # plan (so never reached the hook) cannot be vouched for.
+            not_run = sorted((queries | set(plan_diffs)) - set(executed))
+            if not_run:
+                verdict = {"same": False, "why": f"{len(not_run)} queries not executed, first {not_run[0]}"}
+            else:
+                verdict = {"same": True}
+        if executed:
+            verdict["executed"] = len(executed)
+        if plan_diffs:
+            verdict["plan_diffs"] = len(plan_diffs)
     except BaseException as e:  # noqa: BLE001
         verdict = {"same": False, "why": f"crash {type(e).__name__}: {e}"[:200]}
     verdict["cpu_s"] = round(time.process_time(), 3)

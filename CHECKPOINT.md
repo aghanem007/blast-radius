@@ -403,6 +403,230 @@ run costs (`sim_try.py`): samples about -18 s per 30 commits, 0 misses on 327 la
 (drop only what we ran) is worth about -3 s. To build: test packages in the image (pytz, tzdata, duckdb, numpy, pandas from
 `requirements.lock`), skipped tests = unknown, stop at the first failure, amortise test-module imports, audit against labels.
 
+## 17. `exp/cheaper-checks` SUBMITTED (BB-401A9017, Sat 12:46 PM): 211.8 s
+
+User said "Yes, submit it". Commit `430d29b9b7cd6bd4d2ab53cbc4505a614cddf2c2` (branch `exp/cheaper-checks`, pushed; clean
+build of the commit 28 s; sandbox samples 126.999, module 461.44, tricky 245.049, 0 misses). Practice, all 3 runs:
+**194.714 s simulated, 17.11 / 16.87 / 17.41 s CPU, 0 missed -> 211.8 s.**
+- vs BB-1E9B075A (5083396, 214.9): simulated unchanged, CPU -3.05 s. So the executor-side check (`BR_EC_BACK`) found
+  nothing to drop on the 40 practice commits and wasted nothing; the gain is the cheaper import-state checks alone.
+  3 s at ~0.12-0.2 s saved per check means roughly 15-25 of the 40 practice commits run an import-state check: practice has
+  far more class-level / module-level / header commits than the samples (5 of 30).
+- Still 3.3 s behind BB-EA6DA914 (5b51ebc, 208.5), which can miss on module-level edits. 430d29b is the best build without
+  that hole.
+- Final pick is still **BB-5E85C0A3** (216.8). The page now words it: "Your final entry is the one you picked (216.8 s).
+  You have scored 208.5 s. Unless you pick again, 216.8 s goes to the final." and offers a button "Make 208.5 s our final
+  entry" (NOT clicked: the user's decision). Next slot 1:46 PM.
+- The page's rule changed: the repository must be public when submitting; "once a submission is scored you may make the
+  repository private: we keep a copy of every commit we score, and the final uses that copy."
+- README submission log has the new row in the working tree (not committed).
+
+## 18. PREFERRED FINAL CANDIDATE (user, Sat ~12:55): `430d29b` = BB-401A9017 (211.8 s). Page pick NOT changed yet.
+
+User: "use whatever version ... as our preferred final candidate for now whichever is best that you suggest, since it has no
+known correctness holes. We can make the actual final-selection change separately."
+- Preferred candidate: **BB-401A9017**, commit `430d29b9b7cd6bd4d2ab53cbc4505a614cddf2c2` (branch `exp/cheaper-checks`): best
+  score among the builds without a known hole. A later build replaces it only if it is validated the same way AND scored.
+- **The track page still enters BB-5E85C0A3 (216.8 s).** Switching it (button "Pick as our final entry" on the BB-401A9017
+  row) is a separate step the user will ask for; do not click it without that. Before the cutoff (Sun 11:00 AM ET) remind
+  the user that the page pick and the preferred candidate differ.
+
+**Experiment asked for (user, same message):** build the risky shortcut ("every cheap candidate passes when we run it
+ourselves -> also drop the giant tests") on a separate branch (`exp/trust-cheap`, from 430d29b), test it on ALL labeled
+patches, especially executor-only and rare-input adversarial ones where cheap tests can pass while the expensive test fails.
+If it misses: look for a narrow condition where it is safe; otherwise recommend rejecting it.
+- New adversarial set: `work/exp_fronthalf/make_trap_mutants.py work/mutants_trap 45 71 8` = single-token mutants on
+  function-body lines run by a giant test (> 3 s) and by only 1-8 cheap tests (84 such lines in executor/planner code, 488
+  elsewhere). To be labeled with the full suite into `work/label_trap.json`.
+
+## 19. Experiment `exp/trust-cheap` (Sat 13:00-): the shortcut MISSES on a trap patch. Interim state.
+
+Branch `exp/trust-cheap` (from 430d29b; changes STAGED, not committed): `try_first()` in selector.py (`BR_TRY_FIRST=1` =
+careful: drop only tests we ran and saw pass; `BR_TRUST_CHEAP=1` = also drop the giant tests > 3 s unrun when EVERY cheap
+candidate ran here and passed; narrowing knobs `BR_TRUST_MIN_TESTS`, `BR_TRUST_NOT_IN`), prerun.py (a skipped test counts as
+failing; stop at the first failure), Dockerfile (+ pytz, tzdata, duckdb, numpy, pandas: build +60 s, image 253 -> 547 MB).
+Image `br-tc` (built while the labeler was running: its stored CPU costs are inflated, rebuild on an idle machine before
+measuring time). Only applies to pure function-body patches (code swap).
+- Runner fidelity (`BR_PRERUN=1 BR_AUDIT=1`, `work/exp_fronthalf/audit_try.py`): 5,173 test verdicts on 67 patches
+  (samples, proxy, rare, big): 0 disagreements with the real suite.
+- Trap set `work/mutants_trap` (87; labels `work/label_trap.json`, eval dir `work/eval_trap` via `make_eval_dir.py`):
+  **MISS on `t71e011`** = `sqlglot/executor/python.py:479` `elif step.limit > 0 and not group_by:` -> `or`: the 5 cheap
+  executor tests that run the line all pass, test_execute_tpcds fails. Confirmed in the sandbox (`misses: ["t71e011"]`).
+- All uses so far (`shortcut_table.py`): 24 uses, 1 wrong. 21 of the 24 are in executor/planner code. By number of cheap
+  tests that passed: 1-5: 17 uses (1 wrong); 6-20: 4; 21-60: 3. Samples: one use (66ks, 50 cheap tests, right).
+- Second trap set `work/mutants_trap2` (60; giant + 20..200 cheap tests on the line; prefix `u72`): to label after the
+  first (`python tools\mutate\label.py work\mutants_trap2 work\label_trap2.json --jobs 6 --parallel 2`), to test the
+  candidate narrow rule "only when at least ~20 cheap tests passed".
+- For the same commits the preferred candidate already has a SOUND check (executor-side early cutoff, ~15-17 s CPU for
+  all 57 queries); the shortcut would replace that by ~2-6 s of cheap tests. That difference is all it can gain.
+
+## 20. Shortcut verdict so far (Sat 13:55): REJECT. Careful alternative found (plan-diff execution), not yet measured idle.
+
+- **Narrow rule "only when many cheap tests passed": not usable.** `work/exp_fronthalf/giant_check.py work\mutants_trap2
+  work\gc_trap2 br-tc` (runs the shortcut, then the dropped giant tests with real pytest): on the 60 patches of the second
+  trap set (giant + 20-200 cheap tests on the line) the shortcut fired only 4 times (all right); 27 times a cheap test
+  failed; 28 times a cheap candidate we cannot run (test_scope / test_tpcds / test_annotate_funcs have no measured cost)
+  was selected, which keeps the giants. All data: with >= 20 cheap tests 7 uses, 0 wrong (too few to call safe, too rare to
+  matter); with 1-5 cheap tests 17 uses, 1 wrong.
+- **Narrow rule "not in executor/planner code": leaves nothing.** 21 of 24 uses are there.
+- **What a use is worth** (`shortcut_value.py`, 8 uses on samples/proxy/rare/big): on average 14.5 s over the preferred
+  build. In 5 of 8 the preferred build already drops test_execute_tpcds with its sound check and the shortcut only saves
+  CPU (8-14 s); in 3 of 8 the sound check keeps the test because a query PLAN differs although the results do not.
+- **Careful alternative for those 3: `BR_EC_PLAN_DIFFS`** (already in earlycut.py, off): when the front half is identical
+  except for some queries' plans, execute just those queries and compare result fingerprints. Run under load on image
+  `br-cc-final` with `BR_EC_PLAN_DIFFS=57 BR_EC_PLAN_DIFF_CPU=12 BR_EC_DEADLINE=100000`: samples 126.999 (same), proxy
+  255.381 (same), rare 317.212 -> **234.153** (4 more drops), **0 misses** on all three. Trap set run pending.
+  TO DO on an idle machine: misses on every labeled set incl. trap, real CPU cost, then decide the default budget.
+- Labeling of `work/mutants_trap` still running (52 of 87 at 13:52; task writes `work/label_trap.json`). After it:
+  `python work\exp_fronthalf\make_eval_dir.py work\mutants_trap work\label_trap.json work\eval_trap`, rerun the shortcut
+  and the plan-diff mode on it, then label trap2 the same way if more evidence is wanted.
+- `BR_TRY_FIRST=1` (careful: drop only tests we ran and saw pass) is sound as far as the runner agrees with the real suite
+  (5,173 verdicts, 0 disagreements); simulated gain ~3 s per 30 commits; needs the test packages in the image. Measure idle.
+
+## 21. Branch `exp/plan-diffs` (Sat 14:00-14:40, from 430d29b; STAGED, nothing committed): careful plan-diff check + two soundness fixes
+
+User (13:55): "Yes, do that" = reject the shortcut, pursue the careful alternative. The rejected experiment is committed
+LOCALLY ONLY as `42afa17` on `exp/trust-cheap` (not pushed; never submit it).
+User (14:20, mid-turn): **"Claude 2 finished its independent review and found two potential correctness issues involving the
+time-budget fallback and test-file imports. ... Once those [benchmarks/background jobs] are finished, remind me to share the
+full review so we can investigate the findings before deciding on our final submission."** -> REMIND THE USER; do not pick
+or submit a final before that review is discussed.
+
+**A. Plan-diff check, on by default (`BR_EC_PLAN_DIFFS=12`).** For a front-half patch that changes some queries' PLANS only,
+those queries are executed with the new plan and their results compared with the pinned commit's (sound: the test compares
+exactly `table.columns` / `table.rows` with DuckDB's answer for an unchanged SQL string). Changes in earlycut.py:
+every query that must be executed (plan changed, or the patch reaches its back half) runs as soon as its plan exists and
+the first different result ends the check; a CPU timer (ITIMER_VIRTUAL, `_TooSlow`) gives up on a front half over 1 s + 2x
+its usual CPU and on a query over 1 s + 3x its own (a mutant made one query run away: 30 s burned before, 3.7 s now).
+Budget = min(12 s, 0.6 x what is left of the saving); cap 12 changed plans (measured: 11 of 12 checks with 1-9 changed plans
+dropped the test; 3 of 4 with 17-29 ran out). `noop_check.py` in the image: unpatched code is "same" in all 5 modes.
+Idle machine, image `br-pd` (tree a52fe4a), test seconds + CPU, off -> on, **0 misses everywhere**:
+samples 150.7 -> 150.7; eval_proxy 297.5 -> 281.1; eval_rare 378.3 -> 284.2; eval_trap (56 labeled) 1186.1 -> 1121.3;
+eval_exotic same; eval_big 970.1 -> 993.1 (before the 12-plan cap; that set also hits the time budget, 71 heavy commits).
+Real-test audit of every giant-test drop on unlabeled patches: `work/exp_fronthalf/giant_audit.py <patches> <work> br-pd
+--env BR_EC_DEADLINE=100000` -> results in `work/ga_trap2/giant_audit.json`, `work/ga_trap/giant_audit.json` (running).
+
+**B. Soundness fix 1: no more silent fall-back to the older rule** (`resolve_class_level`). Out of time, no verdict (timeout,
+crash, hang at import) or a failed check now select EVERY test (the older rule misses derived state, and a patch that hangs
+the import fails everything). Only "no baseline in the image" still uses the older rule. The early cutoff now stops at
+110 s (`BR_EC_DEADLINE`), the import-state check may run until 160 s (`BR_CA_DEADLINE`). A patch that mixes class-level
+edits with function-body edits in OTHER files now runs the check on the import-time files only (was: older rule for all).
+**C. Soundness fix 2: test files that other test files import.** `tests/dialects/test_dialect.py` (Validator) is imported
+by 33 test files holding 907 tests. Import-time code in a test module, a syntax error in it, or the header of a def at
+module/class level in it now select its tests AND its importers' (`test_module_and_importers`); a def header in a test
+helper (`tests/helpers.py`) selects everything. Before: only that file's 113 tests (or 6 for the helper header).
+Hand-made patches `work/mutants_review` (v01-v07, `make_review_patches.py`), old 430d29b vs fixed (`compare_select.py`):
+v01/v02/v03 113 -> 1020 tests; v04 550 -> 1020; v05 (mixed) 200 -> 32; v06 all -> all; v07 6 -> all.
+Being labeled with the real suite into `work/label_review.json` (v06 loops forever at import: not labelable).
+Image with A+B+C: `br-fx` (tree b4fbe70, built under load: rebuild idle before timing).
+TO DO: finish audit + labels, rebuild idle, rerun ALL labeled sets (expect same numbers as before except where intended),
+then report. Trap labeling was paused at 56 of 87 (resume: `python tools\mutate\label.py work\mutants_trap
+work\label_trap.json --jobs 6 --parallel 2`).
+
+## 22. `exp/plan-diffs` VALIDATED (Sat 15:15), STAGED tree `d0c6981b2b7b9c09886c996f54edfb8a7eefcb5f`, NOT committed / pushed / submitted
+
+Image `br-fx` is built from that tree on an idle machine. On top of section 21 (A plan-diff check, B no fall-back to the
+older rule, C test-file importers) it has:
+- **Fixed reference costs for the "is the check worth it" gate** (`EC_FRONT_REF_S` 4.3, `EC_SETUP_REF_S` 1.0,
+  `EC_BACK_REF_S` 11.3) instead of the CPU measured during the image build. Found because an image built while the labeler
+  was running stored front 6.2 s / back 19.4 s and then skipped the executor check on sample 66ks (148.453 instead of
+  126.999): the scorer's build machine would have decided what we select. Only the per-query split still comes from the
+  baseline.
+- **Adaptive time budget**: the early cutoff may start a check until min(145 s, 160 s - 5 s - 1.2 s x commits still to
+  come); the import-state check until 160 s (`BR_CA_DEADLINE`), after which an import-time change selects every test.
+  Import-state check CPU limit 2 s + 4x its usual cost.
+- Real-test audit finished: **94 giant-test drops on the 147 trap patches, 0 wrong** (36 executor code reached and queries
+  re-executed, 43 front half identical, 15 plan changed and queries re-executed). `work/ga_trap*/giant_audit.json`.
+- Review patches labeled (`work/label_review.json`): v01/v02/v03 really fail 1020 tests (430d29b selects 113 -> leaves out
+  907), v07 fails 1377 (430d29b selects 6 -> leaves out 1371), v04 399 and v05 9 (both builds select them all).
+  **So the preferred candidate 430d29b has a real hole for import-time edits in test files; this build does not.**
+
+Sandbox, default flags, idle, **446 labeled patches, 0 misses, valid output** (simulated + CPU; 430d29b in brackets where it
+differs): samples 126.999 + 23.5..25.5; eval_proxy 233.927 + 47.9 [255.381 + 42]; eval_rare 212.699 + 72.7 [317.212 + 61];
+eval_big 851.69 + 124.3 [862.164 + 108]; eval_trap (56) 923.907 + 126.9 [1052.631 + 133]; eval_exotic 47.68 + 1.0;
+review (6) 99.175 + 1.9 [misses on 4]; module 461.44 + 24.4; header 438.024 + 27.8; fixture 381.477 + 23.3;
+tricky 245.049 + 11.3; class 938.139 + 108.7. `noop_check.py`: ALL SAME.
+Expected on practice: about the same as BB-401A9017 (211.8); the gains are on commits that touch optimizer/planner/executor
+code with test_execute_tpcds selected, which the 40 practice commits apparently do not have.
+
+**Machine state at 15:15:** idle, no containers, no leftover processes. Trap labeling was paused ON PURPOSE at 56 of 87 to
+free the machine for timing (resume command in section 21); not needed for the candidate.
+**Next:** (1) the user shares Claude 2's full review; compare its two findings (time-budget fallback, test-file imports)
+with fixes B and C; (2) with the user's go-ahead: `git commit -F <msg>` (no Claude attribution), clean `--no-cache` build of
+the commit + samples in the sandbox, push `exp/plan-diffs`, submit; (3) this build then replaces 430d29b as the preferred
+final candidate if its practice run is clean (the page pick is still BB-5E85C0A3 and is the user's to change).
+
+## 23. Claude 2's independent review (pasted by the user Sat ~15:20) and my check of it
+
+**Miss risks it found:** (1) broken / import-time-edited `tests/dialects/test_dialect.py` selects only its own tests
+(selector.py:599, :719) -> FIXED in `exp/plan-diffs` (section 21 C), confirmed with real labels. (2) "out of time budget"
+returns the older class rule (selector.py:482) -> FIXED (section 21 B; I reserve time per remaining commit instead of its
+suggested two passes; crash / hang / failed check also go to every test). (3) the track page still enters BB-5E85C0A3 ->
+the USER must switch the pick before Sun 11:00 AM. Lower probability: a statement INSERTED mid-function selects everything
+or all class users (safe, expensive; cheap sound improvement = tests that ran the enclosing function, NOT built); a
+docstring edit selects only test_docs; shared-state corruption across tests is invisible to any map.
+
+**Score recommendations (none built):** R1 replay test_max_nodes at reduced width (a calculated risk, not a proof: I read
+the test, the 1,000,000-node parse needs >= ~3,300 of the 10,000 columns, so a short replay is a different computation);
+R2 run the real test_generator_memory in the import-check child (sound; ~2.1 s vs 6.7 s recorded); R3 early cutoff for
+test_execute_tpcds on import-time edits by recording which class attributes the executor half reads (sound, new recording);
+R4 record where a bool flag is USED (truth-tested) instead of read (new recording, large); R5 run small candidate sets in
+the import-check child (it thinks `maps/prerun_costs.json` is inflated; pool-based optimizer tests really do cost more CPU
+than their wall time, the rest is about 1x).
+
+**My check (`work/exp_fronthalf/giants_table.py`, fixed build):** its numbers hold on OUR sets: needless giants cost 316 s
+of the class set's 621 s waste, 209 of 350 (module), 204 of 366 (header); test_max_nodes selected 25 times, fails 2, never
+alone; test_generator_memory 40 / 5 / never alone; test_execute_tpcds 131 / 41 / 5 alone. **But on the 30 official samples
+no giant is ever selected needlessly (0.0 s)**: the samples' remaining 32.6 s waste is 4d63 9.1, 2haz 8.7 and seven small
+commits (11.3 s). Our sets over-represent base-class bool flags (75 of 120 class mutants). Practice (194.7 s over 40
+commits) can hold at most about one 36.8 s commit. So whether R1-R4 matter is unknown -> a second DIAGNOSTIC submission
+(count per giant how many practice commits select it, commit kinds, check outcomes) is the way to decide; R5 is where the
+samples' waste is.
+
+## 24. Second review ("Claude 1", pasted Sat ~15:40): three more gaps, all FIXED and validated. STAGED tree `1d43c5804c3fddafb26f0b001b8ac9704b946271` (image `br-fz`), NOT committed / pushed / submitted
+
+The review confirmed fixes B and C work and found, on kinds of edit none of our labeled patches had:
+| # | Its crafted edit | 430d29b selects | Really fails (our full-suite label) | Now |
+| --- | --- | --- | --- | --- |
+| 1 | delete enum member `TokenType.IPV4` (w01) | 5 | 1600 | all |
+| 1 | rename `class ParseError` (w02) | 157 | 1600 | all |
+| 2 | rename `sqlglot.transpile` (w03) | 41 | 300 (8 test files import it) | all |
+| 3 | `execute()` builds the executor without tables (w04) | 49, test_execute_tpcds dropped | 46 incl. test_execute_tpcds | 50, kept |
+**Fixes in selector.py:**
+1. Class-level change that is not a plain observable assignment (enum member, the class line, a non-assignment statement,
+   lines inserted between class statements, an unobserved attribute) -> EVERY test (was: older "users of the class" rule,
+   with no check). Module-level statements the check cannot take (non-name targets) -> every test. Without the attribute map
+   (e.g. tests.json lists a test the map lacks) every import-time change in sqlglot -> every test. `keep()` is gone: the
+   older rules now only supply the "(older rule: N)" figure in the log.
+2. A def or class statement now STARTS AT ITS FIRST DECORATOR (`Stmt.start`), so a decorator edit is a header edit decided
+   by the import-state check (w05: delete `@classmethod`: 1284 -> 1235 tests, 679 really fail, none left out).
+3. The import-state verdict: a REMOVED module-level name -> every test (test files that import it by name stop loading);
+   an ADDED class attribute -> every test (it can shadow an inherited one whose readers are recorded under the parent; w06).
+4. Early cutoff: a patch touching `sqlglot/executor/__init__.py` is "not decidable" (the check runs execute() with a
+   stand-in executor, so what execute() does around the real one is invisible).
+5. No class-state baseline in the image -> one is made at run time (0.6 s) into the temp dir; if that fails -> every test.
+6. Score, sound: lines inserted BETWEEN STATEMENTS OF A FUNCTION -> the tests that ran that function's body (was: every
+   test or all users of the class); if the function runs at import -> every test.
+7. Limits that stop a runaway early-cutoff check stretch with the build's measured speed (`slow` = measured front / 4.3,
+   at least 1) and the CPU backstop is 1 + 3x (was 2x); the gate itself still uses the fixed reference costs.
+**New labels** `work/label_ins.json` (22: 16 random insertions `i81*` from `make_insert_mutants.py`, w01-w06):
+newest build leaves out 0 on all 22; 430d29b leaves out 1595 / 1443 / 259 / 1 on w01-w04. Insertions: e.g. 1519 -> 36
+tests, all -> 4, 1347 -> 1, with every failing test kept.
+**Idle validation of `br-fz`, 468 labeled patches, 0 misses, valid output** (simulated + CPU): samples 126.999 + 23.5;
+proxy 233.927 + 46.1; rare 212.699 + 70.8; exotic 47.68 + 1.0; review 99.175 + 2.0; big 851.69 + 116.5; trap (56)
+902.453 + 129.1; insertions/review-2 (22) 400.922 + 5.5; module 461.44 + 23.7; header 438.024 + 27.0; fixture
+381.477 + 22.8; tricky 245.049 + 11.1; class 938.139 + 106.2. Identical to the previous build wherever nothing was meant
+to change; the new "every test" rules fire 0 times on the older sets. `noop_check.py`: ALL SAME.
+**Seen under load, not a bug:** with the labeler running, a 120-commit class run took > 160 s and 40 commits fell to
+"out of time budget -> all" (2100 s instead of 938 s). On the scorer a batch is 40-60 commits and ~20 s; the rule says the
+final has 4.5 min, but the deadlines stay sized for 3 min (overrunning a limit would reject the whole run).
+**Still open (reviews' score ideas, none built):** genmem real run, TPC-DS on import-time edits, bool-flag "used not read",
+max_nodes replay (a guess: rejected for the final), small candidate sets in the import-check child; a diagnostic
+submission to count giant-test selections and measure the server's speed. Residual, unmeasurable: the checks run with a
+fixed hash seed and in one process where the real test uses several.
+**Next:** user's go-ahead -> commit (no Claude attribution), clean rebuild of the commit + samples, push `exp/plan-diffs`,
+submit. If clean on practice it replaces 430d29b as preferred final candidate. PAGE PICK IS STILL BB-5E85C0A3.
+
 # >>> END OF HANDOFF. Full history below. <<<
 
 

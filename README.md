@@ -93,3 +93,4 @@ samples, and `tools/mutate/label.py` labels them by running the real suite in th
 | BB-F4BEB122 (diagnostic) | `89112d3` | `diag/telemetry-1` | Same selections; reports how the selector classified the commits. Not a candidate. | 218.877 + 53.03 s, 0 | 271.9 |
 | BB-EA6DA914 | `5b51ebc` | `exp/class-attrs` | + class-attribute selection | 202.814 + 5.65 s, 0 | 208.5 |
 | BB-1E9B075A | `5083396` | `exp/module-level` | + module-level assignments, function headers, TPC-DS fixture | 194.714 + 20.16 s, 0 | 214.9 |
+| BB-401A9017 | `430d29b` | `exp/cheaper-checks` | + cheaper import-state check, executor-side early cutoff | 194.714 + 17.11 s, 0 | 211.8 |

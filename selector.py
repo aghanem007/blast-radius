@@ -300,7 +300,9 @@ class Stmt:
 
     def __init__(self, node, func, cls, parent) -> None:
         self.node = node
-        self.start = node.lineno
+        # A def or class starts at its first decorator: a decorator line is part of the
+        # statement that defines the function, not of whatever encloses it.
+        self.start = min([node.lineno] + [d.lineno for d in getattr(node, "decorator_list", ())])
         self.end = node.end_lineno or node.lineno
         self.func = func  # innermost enclosing function node, or None
         self.cls = cls  # dotted class path inside the module, or None
@@ -392,6 +394,11 @@ class Selector:
         # would select, who ran the lambda the edit sits in).
         self.attrs: "AttrMap | None" = None
         self.header_floor: set[int] = set()  # per patch: tests that ran an edited def's lines
+        # per patch and Python file, the kinds of change in it: decided by the import-state
+        # check ("deferred"), a statement inside a function body ("runtime"), or "other"
+        self.file_kinds: dict[str, set[str]] = {}
+        self._test_importers: dict[str, set[str]] | None = None
+        self._class_base_path = str(CA_BASE_PATH)
         self._name_lines: dict[str, set[tuple[str, int]]] | None = None
         self.class_spots: list[tuple[str, set[str], set[int] | None, set[int] | None]] = []
         # Per patch: every file it touches, and the new text of changed data files we
@@ -413,6 +420,7 @@ class Selector:
         self.runtime_spots = []
         self.class_spots = []
         self.header_floor = set()
+        self.file_kinds = {}
         self.place_calls = 0
         self.changed_paths = []
         self.data_sources = {}
@@ -440,7 +448,28 @@ class Selector:
         if self._class_base is False:
             import classstate
 
-            self._class_base = classstate.load_baseline(str(CA_BASE_PATH))
+            self._class_base_path = str(CA_BASE_PATH)
+            self._class_base = classstate.load_baseline(self._class_base_path)
+            if self._class_base is None:
+                # The image should carry it. If it does not (the build step failed, or
+                # another interpreter made it), make it now: under a second of CPU,
+                # against selecting every test for every import-time change.
+                import subprocess
+                import tempfile
+
+                out = os.path.join(tempfile.gettempdir(), "br_class_state.json")
+                env = dict(os.environ, PYTHONHASHSEED="0", PYTHONDONTWRITEBYTECODE="1")
+                try:
+                    subprocess.run(
+                        [sys.executable, str(APP / "classstate.py"), "baseline", str(SRC.resolve()), out],
+                        env=env, capture_output=True, timeout=30,
+                    )
+                    self._class_base = classstate.load_baseline(out)
+                except Exception as e:  # noqa: BLE001
+                    log(f"class-state baseline could not be made ({e!r})")
+                if self._class_base is not None:
+                    self._class_base_path = out
+                    log("class-state baseline was missing from the image: made one at run time")
         return self._class_base
 
     def resolve_class_level(self) -> set[int] | None:
@@ -463,33 +492,53 @@ class Selector:
         # class spots are "pkg.mod.Class" + ":" + NAME, module spots "pkg.mod:" + ":" + NAME
         edited = {f"{qual}:{name}" for qual, names, _, _ in self.class_spots for name in names}
 
-        def keep(why: str):
-            log(f"  class attributes {sorted(edited)[:3]}: {why} -> older rule")
-            return old_union
+        def give_up(why: str):
+            # The older rule can leave failing tests out (it misses state other classes
+            # derive at import, and a patch that hangs or breaks the import fails every
+            # test). When the check was possible but did not answer: every test.
+            log(f"  class attributes {sorted(edited)[:3]}: {why} -> all")
+            return ALL
 
         if not CLASSATTR or self.attrs is None:
-            return old_union
-        if self.place_calls != len(self.class_spots):
-            return keep("the patch also changes other Python code")
+            return ALL  # nothing is sent here without the attribute map; never the older rule
         base = self.class_baseline()
         if base is None:
-            return keep("no class-state baseline")
+            return give_up("no class-state baseline, and none could be made")
         import classstate
 
+        # Which files to import patched: all of them, except a file whose every change is
+        # a statement inside a function body. Such a statement does not run at import
+        # (place() sends the ones that do to "all"), its tests come from the line map,
+        # and importing it patched would only make the changed function, and every
+        # table that holds it, show up as "changed". A file that mixes both kinds is
+        # imported patched: that only adds tests.
+        overrides = {p: text for p, text in self.new_sources.items() if self.file_kinds.get(p) != {"runtime"}}
         cost = max(0.5, float(base.get("cpu_s", 2.0)))
-        remaining = EC_DEADLINE_S - (_wall() - _STARTED)
+        remaining = CA_DEADLINE_S - (_wall() - _STARTED)
         wall = min(5 + 5 * cost, remaining)
         if wall < 3 + 2 * cost:
-            return keep("out of time budget")
-        verdict = classstate.run_check(str(SRC.resolve()), str(CA_BASE_PATH), dict(self.new_sources), wall, 1 + 3 * cost, log)
+            return give_up("out of time budget")
+        # CPU limit: generous (about 6x a normal check), because no answer now means
+        # "every test"; a patch that hangs the import still stops after a few seconds.
+        verdict = classstate.run_check(str(SRC.resolve()), self._class_base_path, overrides, wall, 2 + 4 * cost, log)
         if verdict is None:
-            return keep("the import-state check gave no verdict")
+            return give_up("the import-state check gave no verdict (timeout or crash)")
         if not verdict.get("ok"):
             if "import error" in str(verdict.get("why", "")):
-                log(f"  class attributes {sorted(edited)[:3]}: sqlglot no longer imports ({verdict['why'][:120]}) -> all")
-                return ALL
-            return keep(f"the import-state check failed ({verdict.get('why')})")
+                return give_up(f"sqlglot no longer imports ({verdict['why'][:120]})")
+            return give_up(f"the import-state check failed ({verdict.get('why')})")
         changed = set(verdict["changed"])
+        # A module-level name that is gone (deleted or renamed): a test FILE that imports
+        # it by name no longer loads, and all of its tests fail, whether or not they
+        # ever ran a line that mentions the name.
+        gone = sorted(k for k in verdict.get("removed", ()) if "::" in k)
+        if gone:
+            return give_up(f"removes module-level names {gone[:3]} that other files may import")
+        # A class attribute that is new can shadow one the class inherited: the tests
+        # that read the inherited one through this class are recorded under its parent.
+        new_attrs = sorted(k for k in verdict.get("added", ()) if "::" not in k)
+        if new_attrs:
+            return give_up(f"adds class attributes {new_attrs[:3]} that may override inherited ones")
         was = "all" if old_union is ALL else len(old_union)
         kinds, ranges = verdict.get("kinds", {}), verdict.get("ranges", {})
         # Who can see each changed thing.
@@ -596,8 +645,8 @@ class Selector:
             return ALL
         new = "\n".join(new_lines)
         if _code_list(new) is None:  # does not compile
-            log(f"  {path}: syntax error after patch -> {'its tests' if self.is_test_module(path) else 'all'}")
-            return self.whole_test_file(path) if self.is_test_module(path) else ALL
+            log(f"  {path}: syntax error after patch -> {'its tests and its importers' if self.is_test_module(path) else 'all'}")
+            return self.test_module_and_importers(path) if self.is_test_module(path) else ALL
         if same_tree(old, new):
             log(f"  {path}: same compiled code (comments/formatting) -> none")
             return set()
@@ -619,9 +668,12 @@ class Selector:
             removed, after = hunk_changes(old_start, body)
             spots = [(ln, ln) for ln in removed] + [(a, a + 1) for a in after]
             for lo, hi in spots:
+                deferred, runtime = len(self.class_spots), len(self.runtime_spots)
                 got = self.place(path, stmts, lo, hi)
                 if got is ALL:
                     return ALL
+                kind = "deferred" if len(self.class_spots) > deferred else "runtime" if len(self.runtime_spots) > runtime else "other"
+                self.file_kinds.setdefault(path, set()).add(kind)
                 out |= got
         return out
 
@@ -668,6 +720,64 @@ class Selector:
     def whole_test_file(self, path: str) -> set[int]:
         return set(self.m.tests_by_file.get(path, set()))
 
+    def test_importers(self) -> dict[str, set[str]]:
+        """For each file under tests/: the files under tests/ that import it, directly or
+        through another one (read from the pinned source, once per run)."""
+        if self._test_importers is not None:
+            return self._test_importers
+        modules: dict[str, str] = {}
+        root = SRC / "tests"
+        for p in sorted(root.rglob("*.py")) if root.is_dir() else ():
+            rel = p.relative_to(SRC).as_posix()
+            name = rel[:-3].replace("/", ".")
+            modules[name[: -len(".__init__")] if name.endswith(".__init__") else name] = rel
+        direct: dict[str, set[str]] = {}
+        for name, rel in modules.items():
+            try:
+                tree = ast.parse((SRC / rel).read_text(encoding="utf-8"))
+            except (OSError, SyntaxError, ValueError):
+                continue
+            package = name if rel.endswith("__init__.py") else name.rsplit(".", 1)[0]
+            for node in ast.walk(tree):
+                targets: list[str] = []
+                if isinstance(node, ast.Import):
+                    targets = [a.name for a in node.names]
+                elif isinstance(node, ast.ImportFrom):
+                    base = node.module or ""
+                    if node.level:
+                        parts = package.split(".")
+                        base = ".".join(parts[: len(parts) - node.level + 1] + ([node.module] if node.module else []))
+                    targets = [base] + [f"{base}.{a.name}" for a in node.names]
+                for t in targets:
+                    # importing a.b.c imports a and a.b as well
+                    bits = t.split(".")
+                    for i in range(1, len(bits) + 1):
+                        hit = modules.get(".".join(bits[:i]))
+                        if hit is not None and hit != rel:
+                            direct.setdefault(hit, set()).add(rel)
+        closed: dict[str, set[str]] = {}
+        for start in direct:
+            seen: set[str] = set()
+            todo = [start]
+            while todo:
+                for who in direct.get(todo.pop(), ()):
+                    if who not in seen:
+                        seen.add(who)
+                        todo.append(who)
+            closed[start] = seen
+        self._test_importers = closed
+        return closed
+
+    def test_module_and_importers(self, path: str) -> set[int]:
+        """A test module's own tests plus the tests of every test module that imports it:
+        `tests/dialects/test_dialect.py` holds the Validator base class of 33 other
+        files, so what its import-time code does (or a failure to import it) reaches
+        their tests too."""
+        out = self.whole_test_file(path)
+        for other in self.test_importers().get(path, ()):
+            out |= self.whole_test_file(other)
+        return out
+
     def place(self, path: str, stmts: list[Stmt], lo: int, hi: int) -> set[int] | None:
         """Tests affected by a change at old lines lo..hi of a Python file."""
         self.place_calls += 1
@@ -699,6 +809,23 @@ class Selector:
             self.runtime_spots.append((path, s.start, first, outer.end_lineno or outer.lineno))
             return got
 
+        # Between two statements of a function's own body (lines inserted there, or a
+        # change that spans several of its statements): it can only matter to a test
+        # that runs the function. Everything the function's body ran is the answer.
+        if (
+            isinstance(s.node, (ast.FunctionDef, ast.AsyncFunctionDef))
+            and s.func is None
+            and lo >= s.node.body[0].lineno
+        ):
+            first_body = s.node.body[0].lineno
+            if m.ran_at_import(path, first_body, s.end):
+                log(f"  {path}:{lo}: inside {s.node.name}, which runs at import time -> all")
+                return ALL
+            got = m.line_tests(path, first_body, s.end)
+            log(f"  {path}:{lo}: between statements of {s.node.name} -> {len(got)} tests that ran it")
+            self.runtime_spots.append((path, lo, s.start, s.end))
+            return got
+
         # Everything below runs at import time: not something a code swap can try.
         self.prerun_ok = False
 
@@ -714,6 +841,19 @@ class Selector:
                 self.class_spots.append((f"<def {module_name(path)}.{s.node.name}>", set(), got, None))
                 self.header_floor |= ran
                 return set()
+            if s.func is None and path.startswith("sqlglot/"):
+                # no attribute map, so no import-state check: nothing vouches for it
+                log(f"  {path}:{lo}: def header at import time, no import-state check available -> all")
+                return ALL
+            if s.func is None and path.startswith("tests/"):
+                # The header of a def at module or class level in the test tree runs when
+                # the file is imported (decorators, default values): if it raises, the
+                # file does not import, and neither does any test file that imports it.
+                if not self.is_test_module(path):
+                    log(f"  {path}:{lo}: test helper def header -> all")
+                    return ALL
+                got |= self.test_module_and_importers(path)
+                log(f"  {path}:{lo}: ... in a test module: with it and its importers -> {len(got)} tests")
             return got
 
         if self.is_test_module(path):
@@ -729,8 +869,8 @@ class Selector:
             ):
                 log(f"  {path}:{lo}: test module top-level {type(top.node).__name__} runs at import -> all")
                 return ALL
-            got = self.whole_test_file(path)
-            log(f"  {path}:{lo}: test module import-time code -> its {len(got)} tests")
+            got = self.test_module_and_importers(path)
+            log(f"  {path}:{lo}: test module import-time code -> the {len(got)} tests of it and of the test modules that import it")
             return got
         if path.startswith("tests/"):
             log(f"  {path}:{lo}: test helper import-time code -> all")
@@ -766,7 +906,14 @@ class Selector:
                 callers = None if lam is None else m.line_tests(path, lam.lineno, lam.end_lineno or lam.lineno)
                 self.class_spots.append((qual, defined, old, callers))
                 return set()
-            return old
+            # Anything else in a class body: an enum member, the class line itself (name,
+            # bases), a statement that is not a plain assignment, an attribute the
+            # recorder could not observe, lines inserted between two statements. The
+            # import-state check cannot vouch for these (it does not see bases or special
+            # names), and "the tests that used the class" misses what other classes
+            # derive from it and a change that stops sqlglot from importing at all.
+            log(f"  {path}:{lo}: class-level {type(s.node).__name__} the import-state check cannot vouch for -> all")
+            return ALL
 
         old = self.module_level_older_rule(path, lo, s)
         defined = defined_names(s.node)
@@ -785,7 +932,9 @@ class Selector:
             callers = None if lam is None else m.line_tests(path, lam.lineno, lam.end_lineno or lam.lineno)
             self.class_spots.append((f"{module_name(path)}:", defined, old, callers))
             return set()
-        return old
+        if old is not ALL:
+            log(f"  {path}:{lo}: module-level statement the import-state check cannot decide -> all")
+        return ALL
 
     def module_level_older_rule(self, path: str, lo: int, s: Stmt) -> set[int] | None:
         """A module-level statement, by who mentions the names it defines (the rule before)."""
@@ -1170,9 +1319,15 @@ EARLYCUT = os.environ.get("BR_EARLYCUT", "1") == "1"
 # labeled patches in the sandbox (0 misses; a full re-execution costs ~15 s CPU against
 # 21.5 s + a worker to schedule the test, and a difference usually shows up early).
 EC_BACK = os.environ.get("BR_EC_BACK", "1") == "1"
-# Executing the queries whose PLAN a front-half patch changed is still off: not audited.
-EC_PLAN_DIFFS = int(os.environ.get("BR_EC_PLAN_DIFFS", "0"))  # execute up to this many queries whose plan changed
-EC_PLAN_DIFF_CPU_S = float(os.environ.get("BR_EC_PLAN_DIFF_CPU", "3"))  # ...within this much baseline CPU
+# A front-half patch that changes a query's PLAN can still give the same result. Such a
+# query is executed with its new plan as soon as the plan exists, and its result
+# compared with the pinned commit's; the first different result ends the check.
+# Measured on labeled patches: when a handful of plans change the results are usually
+# the same (11 of 12 such checks dropped the test, 1-9 queries each); when most plans
+# change it rarely pays (3 of 4 ran out of budget after 17-29 queries). Hence the cap.
+EC_PLAN_DIFFS = int(os.environ.get("BR_EC_PLAN_DIFFS", "12"))  # execute up to this many queries whose plan changed
+EC_PLAN_DIFF_CPU_S = float(os.environ.get("BR_EC_PLAN_DIFF_CPU", "12"))  # ...within at most this much baseline CPU
+EC_PLAN_DIFF_SHARE = float(os.environ.get("BR_EC_PLAN_DIFF_SHARE", "0.6"))  # ...and this share of the remaining saving
 # An edit to the TPC-DS fixture file itself: re-run the front half on the patched fixture.
 EC_FIXTURE = os.environ.get("BR_EC_FIXTURE", "1") == "1"
 TPCDS_FIXTURE_PATH = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
@@ -1181,7 +1336,16 @@ EC_BASE_PATH = Path(os.environ.get("BR_EC_BASE", APP / "maps" / "tpcds_base.json
 # The whole batch has 180 s of wall time (270 s in the final). Every check, including
 # its own timeout, must END before this many seconds after the program started; the
 # selection itself takes about a second for the whole batch.
-EC_DEADLINE_S = float(os.environ.get("BR_EC_DEADLINE", "140"))
+EC_DEADLINE_S = float(os.environ.get("BR_EC_DEADLINE", "145"))
+# ...and earlier than that while many commits are still to come: each of them may need
+# an import-state check, so that much time is kept back for them.
+CA_RESERVE_PER_COMMIT_S = 1.2
+_COMMITS_LEFT = 0  # set by main() for each patch: how many come after it
+# The import-state check is what keeps class-level and module-level changes from being
+# missed, and it is cheap (under a second each), so it gets the time the optional early
+# cutoff must leave: it may run until this many seconds. After that such a change
+# selects every test (never the older rule, which can leave failing tests out).
+CA_DEADLINE_S = float(os.environ.get("BR_CA_DEADLINE", "160"))
 # Without the image's baseline the check could compute one at run time, but that costs
 # a full run of both halves: only for development outside the image.
 EC_RUNTIME_BASELINE = os.environ.get("BR_EC_RUNTIME_BASELINE", "0") == "1"
@@ -1189,6 +1353,11 @@ _STARTED = __import__("time").monotonic()
 # Run a check only if dropping the test saves more than the check is expected to cost.
 EC_GAIN_FACTOR = 1.15
 EC_GAIN_MARGIN_S = 1.0
+# Reference CPU seconds of the test's parts at the pinned commit (idle machine, scorer's
+# image and limits): the front half, loading the fixture tables, executing all 57 queries.
+EC_FRONT_REF_S = 4.3
+EC_SETUP_REF_S = 1.0
+EC_BACK_REF_S = 11.3
 
 
 class EarlyCut:
@@ -1200,9 +1369,11 @@ class EarlyCut:
         self.stage = earlycut.StageMap(EC_STAGE_PATH)
         self.number = next((t["number"] for t in tests if t["id"] == earlycut.TPCDS_TEST), None)
         self.base: str | None = None
-        self.front_cpu = 5.0
-        self.setup_cpu = 1.0
+        self.front_cpu = EC_FRONT_REF_S
+        self.setup_cpu = EC_SETUP_REF_S
         self.back_cpu: dict[int, float] = {}
+        self.back_scale = 1.0
+        self.slow = 1.0
         self.tried_base = False
         self.started = _wall()
 
@@ -1219,9 +1390,21 @@ class EarlyCut:
             if raw is None:
                 self.base = None
             else:
-                self.front_cpu = max(1.0, float(raw.get("cpu_s", 5.0)))
-                self.setup_cpu = float(raw.get("setup_cpu", 1.0))
-                self.back_cpu = {int(q): float(s) for q, s in raw.get("back_cpu", {}).items()}
+                # What a check costs is taken from fixed reference figures (measured on an
+                # idle machine), not from the CPU the image build happened to measure: a
+                # busy build machine would inflate those, and the same commit would then
+                # be decided differently from the build that was validated. Only the
+                # split of the back half between the queries comes from the baseline.
+                measured = {int(q): float(s) for q, s in raw.get("back_cpu", {}).items()}
+                total = sum(measured.values())
+                self.back_scale = (EC_BACK_REF_S / total) if total > 0 else 1.0
+                # The LIMITS that stop a runaway check do follow the build's measurement
+                # when it is slower than the reference: on a slower machine a healthy
+                # check must still be allowed to finish.
+                self.slow = max(1.0, float(raw.get("cpu_s", EC_FRONT_REF_S)) / EC_FRONT_REF_S)
+                self.front_cpu = EC_FRONT_REF_S
+                self.setup_cpu = EC_SETUP_REF_S
+                self.back_cpu = {q: s * self.back_scale for q, s in measured.items()}
         return self.base
 
     def plan(self, selector: "Selector"):
@@ -1239,6 +1422,11 @@ class EarlyCut:
             return None
         front, queries = False, set()
         for path, _stmt_start, func_first, func_last in selector.runtime_spots:
+            if path == "sqlglot/executor/__init__.py":
+                # execute() itself: the check runs it with a stand-in executor to capture
+                # the plan, so what execute() does around the real executor (the tables
+                # it hands over, what it returns) is not something the check sees.
+                return None
             where = self.stage.classify(path, func_first, func_last)
             if where is None:
                 return None
@@ -1276,19 +1464,32 @@ class EarlyCut:
             return numbers
         fixture_text = selector.data_sources.get(TPCDS_FIXTURE_PATH) if selector.changed_paths == [TPCDS_FIXTURE_PATH] else None
         diffs = EC_PLAN_DIFFS if (front and self.back_cpu and fixture_text is None) else 0
-        limit = cost + (EC_PLAN_DIFF_CPU_S + self.setup_cpu if diffs else 0.0)
+        budget = 0.0
+        if diffs:
+            # How much executing changed-plan queries may cost: a share of what dropping
+            # the test would still save after the front half is paid for.
+            headroom = (saving - EC_GAIN_MARGIN_S) / EC_GAIN_FACTOR - cost - self.setup_cpu
+            budget = max(0.0, min(EC_PLAN_DIFF_CPU_S, EC_PLAN_DIFF_SHARE * headroom))
+            if budget <= 0:
+                diffs = 0
+        limit = cost + (budget + self.setup_cpu if diffs else 0.0)
         job = {
             "overrides": dict(selector.new_sources), "front": front, "queries": sorted(queries),
             "fixture_text": fixture_text,
-            "max_plan_diffs": diffs, "plan_diff_cpu_s": EC_PLAN_DIFF_CPU_S,
+            "max_plan_diffs": diffs, "plan_diff_cpu_s": budget, "back_scale": self.back_scale,
+            # what the front half usually costs: the child gives up on a run that is
+            # clearly slower than that (and on any query far slower than its usual)
+            "front_cpu_s": self.front_cpu * self.slow,
             # A patch that makes the code loop forever must not cost much: the child is
-            # stopped at about twice the expected CPU (rlimit) or 4x the expected wall time.
-            "cpu_limit_s": 1 + 2 * limit,
+            # stopped at about three times the expected CPU (rlimit) or 4x the expected
+            # wall time, both stretched when this machine measured slower at build time.
+            "cpu_limit_s": 1 + 3 * limit * self.slow,
         }
         # The check's wall-clock timeout never reaches past the deadline; if what is left
         # is not clearly enough for a normal run, the test is simply kept.
-        remaining = EC_DEADLINE_S - (_wall() - _STARTED)
-        wall_limit = min(5 + 4 * limit, remaining)
+        cutoff = min(EC_DEADLINE_S, CA_DEADLINE_S - 5.0 - CA_RESERVE_PER_COMMIT_S * _COMMITS_LEFT)
+        remaining = cutoff - (_wall() - _STARTED)
+        wall_limit = min(5 + 4 * limit * self.slow, remaining)
         if wall_limit < 3 + 2 * limit:
             log(f"  early cutoff: out of time budget ({remaining:.0f}s left, needs ~{limit:.0f}s)")
             return numbers
@@ -1368,7 +1569,10 @@ def main() -> None:
         except Exception as e:  # never a miss: without it every candidate is kept
             log(f"early cutoff unavailable ({e!r})")
 
-    for patch in sorted((DATA / "commits").glob("*.patch")):
+    global _COMMITS_LEFT
+    patches = sorted((DATA / "commits").glob("*.patch"))
+    for position, patch in enumerate(patches):
+        _COMMITS_LEFT = len(patches) - position - 1
         log(f"{patch.stem}:")
         chosen: set[int] | None = ALL
         if selector is not None:
