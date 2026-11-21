@@ -652,7 +652,9 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
 
 # ------------------------------------------------------------------------ prerun
 
-PRERUN = os.environ.get("BR_PRERUN", "1") != "0"
+# Off by default (review, Nov 20): accurate (617 audited verdicts, 0 errors) but it saved
+# ~2 s over 73 patches while adding forks, test packages and a time-budget risk.
+PRERUN = os.environ.get("BR_PRERUN", "0") == "1"
 ELIDE_BIG = os.environ.get("BR_ELIDE", "0") == "1"  # giant-test skip: off until the data supports it
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"  # validation: log the runner's verdict on every cheap candidate
 PROBE_AUDIT = os.environ.get("BR_PROBE_AUDIT", "0") == "1"  # validation: log infection-probe results
