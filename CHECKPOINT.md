@@ -1,4 +1,9 @@
-# Checkpoint: Blast Radius (team 2696). Updated Fri 2026-11-20 ~21:40 ET
+# Checkpoint: Blast Radius (team 2696). Updated Sat 2026-11-21 ~00:30 ET
+
+> **STATUS (Sat Nov 21 ~00:30 ET): FINAL ENTRY = BB-5E85C0A3 (baseline sub-01, 1a9a77b), chosen manually by the user.**
+> Page confirms: "Your pick for the final, BB-5E85C0A3, is not your best score: BB-F7D24F70 scored better. The final
+> enters your pick unless you choose another." genmem experiment STOPPED. Do not submit anything new without a
+> deliberate decision, and re-check the pick afterwards.
 
 Read this first to resume. Cutoff: **Sun 2026-11-22 11:00 AM ET**. Only the final counts
 (60 unseen commits, a 300 s penalty per missed commit, CPU seconds added, ties within 1 s go to
@@ -162,7 +167,7 @@ Open risk for any final use of the probe: build time (542 s under load vs 600 s 
 
 Submission BB-F7D24F70 = exp/probe @ 1f0c94a (tag sub-02-probe): **216.4 s**, 0 misses x3 (213.771 s simulated +
 2.62 s CPU) vs baseline BB-5E85C0A3 216.8 s (215.778 + 1.06). Gain 0.4 s: not worth the build-time risk (542 s
-under load vs 600 s), forks and test packages. DECISION PENDING USER: switch the final entry back to BB-5E85C0A3
+under load vs 600 s), forks and test packages. DECIDED (Sat ~00:30): the user switched the final entry back to BB-5E85C0A3
 (the page auto-entered BB-F7D24F70 as "best score").
 
 ## Waste by slow test (182 labeled patches, baseline)
@@ -171,7 +176,12 @@ test_execute_tpcds: selected 74, failed 22, wasted 882 s (mostly function-body e
 (proxy refuted, slicing rejected, probe gain only 0.4 s on practice).
 test_generator_memory: selected 31, failed 0, wasted 164 s (149 s from class-level dialect edits) -> NEXT EXPERIMENT.
 
-## NEXT EXPERIMENT: test_generator_memory, affected dialects only (approved by user Sat ~00:30)
+## STOPPED: test_generator_memory, affected dialects only (stopped by user Sat ~00:30, nothing built)
+
+Reason: only 1 of the 30 official samples schedules test_generator_memory (535z), so the expected gain on 60 final
+commits is ~5 s net of our own CPU, against a 300 s miss risk and real design traps (dialects loaded earlier can mutate
+shared tables; generator construction also reads Dialect/Tokenizer settings). The fake-bug sets overstate slow-test
+savings (same lesson as the probe: -58.6 s locally, -0.4 s on practice). Plan kept below for reference only.
 
 Goal: for a class-level edit in a dialect class, instead of scheduling test_generator_memory (6.7 s), run its REAL
 logic ourselves (tests/test_generator.py::TestGenerator::test_generator_memory: for each dialect, build 100 generators,
@@ -195,10 +205,13 @@ gc, tracemalloc 1000 more, assertLess(after-before, 1024)) for only the affected
 
 ## CHECKLIST before Sun 11:00 AM ET
 
-- [ ] Find the control on the signed-in submissions panel to choose the final entry; select BB-5E85C0A3 (baseline,
+- [x] DONE Sat ~00:30 (user): final pick set to BB-5E85C0A3. Was: find the control on the signed-in submissions panel to choose the final entry; select BB-5E85C0A3 (baseline,
       1a9a77b) unless we decide otherwise. Probe BB-F7D24F70 (216.4 s) is currently auto-entered as "best score".
       If no control exists: ask organizers in the event chat to set the final to BB-5E85C0A3.
 - [ ] Keep the repo public; never rewrite submitted commits (1a9a77b, 1f0c94a).
+
+- [ ] Ask organizers whether the final rebuilds images or reuses the practice build (informational).
+- [ ] Optional last review of both submissions; change the pick only by deliberate decision.
 
 ## FINAL ENTRY RULE
 
