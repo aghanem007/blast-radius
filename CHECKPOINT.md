@@ -148,6 +148,16 @@ Baseline sub-01 (selector/v2 @ 1a9a77b): **0 misses on 162 labeled patches** (30
 the 40 hidden practice commits. Proxy labeling stopped at 14/20 (already refuted: 5 counterexamples).
 Rare-input adversarial labeling: work/mutants_rare -> work/label_rare.json (running).
 
+## Probe vs baseline, final local comparison (Nov 21, ~02:30)
+
+Scorer sandbox, 182 labeled patches (samples, slow-test 77, exotic 39, cache adv 2, proxy adv 14, rare-input adv 20):
+baseline 2588.4 s, 0 misses; probe variant (exp/probe @ 1f0c94a) 2529.8 s, 0 misses (-58.6 s). Samples: 175.3 -> 154.6 s.
+Probe audit on rare/proxy: every failing bug infected; 2 harmless calls, both correct (8/8 overall).
+Correction: an earlier local check of the baseline on proxy/rare ran without its map (fell back to all tests). The
+sandbox re-check found one apparent baseline miss on rare `m22003c`, traced to a crashed labeling run: 3 clean
+re-runs all fail only test_execute_tpcds (selected). Label corrected in work/label_rare.json (note kept).
+Open risk for any final use of the probe: build time (542 s under load vs 600 s limit) -> trim dependencies first.
+
 ## FINAL ENTRY RULE
 
 The final defaults to the best practice score. The verified baseline is **sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9**
