@@ -74,7 +74,11 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
         # A mutant can loop forever inside the suite's own process-pool workers, where
         # pytest's per-test timeout cannot reach. Bound the whole run instead; a run
         # that hits this limit is UNLABELABLE, never given a guessed label.
-        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=RUN_LIMIT_S)
+        # UTF-8 with replacement: Windows' default code page cannot decode every byte
+        # pytest prints (adv1_dispatch's 40 MB log crashed the labeler).
+        proc = subprocess.run(
+            cmd, capture_output=True, text=True, encoding="utf-8", errors="replace", env=env, timeout=RUN_LIMIT_S
+        )
     except subprocess.TimeoutExpired:
         subprocess.run([DOCKER, "kill", name], capture_output=True)
         raise Unlabelable(f"{cid}: suite still running after {RUN_LIMIT_S // 60} min (likely an infinite loop)")
