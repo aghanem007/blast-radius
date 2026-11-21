@@ -391,7 +391,13 @@ class Selector:
         # the plain class attributes it assigns as (class, names, what the older rule
         # would select, who ran the lambda the edit sits in).
         self.attrs: "AttrMap | None" = None
+        self.header_floor: set[int] = set()  # per patch: tests that ran an edited def's lines
+        self._name_lines: dict[str, set[tuple[str, int]]] | None = None
         self.class_spots: list[tuple[str, set[str], set[int] | None, set[int] | None]] = []
+        # Per patch: every file it touches, and the new text of changed data files we
+        # may want to re-read (the TPC-DS fixture, for the early cutoff).
+        self.changed_paths: list[str] = []
+        self.data_sources: dict[str, str] = {}
         self.place_calls = 0
         self._class_base: dict | None | bool = False
 
@@ -406,7 +412,10 @@ class Selector:
         self.new_sources = {}
         self.runtime_spots = []
         self.class_spots = []
+        self.header_floor = set()
         self.place_calls = 0
+        self.changed_paths = []
+        self.data_sources = {}
         files = parse_patch(patch_text)
         if not files:
             log("  no files in patch -> all")
@@ -414,6 +423,7 @@ class Selector:
             return ALL
         chosen: set[int] = set()
         for fp in files:
+            self.changed_paths.append(fp.path)
             got = self.select_file(fp)
             if got is ALL:
                 self.prerun_ok = False
@@ -450,6 +460,7 @@ class Selector:
         An import error, or a change to state the map cannot observe, selects every test."""
         olds = [old for _, _, old, _ in self.class_spots]
         old_union: set[int] | None = ALL if any(o is ALL for o in olds) else set().union(*olds)
+        # class spots are "pkg.mod.Class" + ":" + NAME, module spots "pkg.mod:" + ":" + NAME
         edited = {f"{qual}:{name}" for qual, names, _, _ in self.class_spots for name in names}
 
         def keep(why: str):
@@ -480,15 +491,35 @@ class Selector:
             return keep(f"the import-state check failed ({verdict.get('why')})")
         changed = set(verdict["changed"])
         was = "all" if old_union is ALL else len(old_union)
-        unseen = sorted(k for k in changed if k not in self.attrs.wrapped)
+        kinds, ranges = verdict.get("kinds", {}), verdict.get("ranges", {})
+        # Who can see each changed thing.
+        extra: set[int] = set(self.header_floor)
+        attr_keys: set[str] = set()
+        unseen = []
+        for k in sorted(changed):
+            if k in self.attrs.wrapped:
+                attr_keys.add(k)  # a class attribute the map observes: its readers
+            elif kinds.get(k) == "func" and k in ranges:
+                for rel, first, last in ranges[k]:  # a function: whoever ran its lines
+                    extra |= self.m.line_tests(rel, first, last)
+            elif "::" in k and kinds.get(k) in ("data", "code"):
+                extra |= self.name_line_tests(k.split("::", 1)[1])  # a module global: by name
+            else:
+                unseen.append(k)
         if unseen:
-            log(f"  class attributes {sorted(edited)[:3]}: changes state the attribute map cannot observe ({unseen[:3]}) -> all")
+            log(f"  class attributes {sorted(edited)[:3]}: changes state nothing here can observe ({unseen[:3]}) -> all")
             return ALL
+        module_tables = any("::" in k for k in changed)
         # Every edit inside a lambda of a table: the tests that ran those lambdas' lines.
         callers: set[int] | None = None
         if all(c is not None for _, _, _, c in self.class_spots):
             callers = set().union(*(c for _, _, _, c in self.class_spots)) | self.attrs.always
-        tests = self.attrs.readers(changed | edited) | self.attrs.always
+        tests = self.attrs.readers(attr_keys | {k for k in edited if "::" not in k}) | self.attrs.always | extra
+        if verdict.get("code_only") and callers is not None and module_tables:
+            # Bodies of functions in a module-level table: there is no reader map for
+            # module globals, so the tests are the ones that ran those functions' lines.
+            log(f"  module table {sorted(changed)[:3]}: only the body of a table entry changed -> {len(callers)} tests ran the entry (older rule: {was}); check cpu {verdict.get('cpu_s')}s")
+            return callers
         if verdict.get("code_only") and callers is not None:
             # Only the body of a function stored in a table changed (same keys, same
             # defaults and closure). To see that, a test must both read a table that
@@ -516,6 +547,13 @@ class Selector:
     # ---- data files (fixtures, docs, config)
     def data_file(self, path: str, fp: FilePatch) -> set[int]:
         out: set[int] = set()
+        if path == TPCDS_FIXTURE_PATH and not fp.binary and fp.old_path == fp.new_path:
+            old = self.source(path)
+            if old is not None:
+                try:
+                    self.data_sources[path] = "\n".join(apply_hunks(old.split("\n"), fp.hunks))
+                except PatchError:
+                    pass
         if path.startswith("sqlglotc/"):
             # test_sqlglotc builds the sqlglotc package; setuptools reads its files in
             # ways our read map may not see (pyproject.toml, MANIFEST.in).
@@ -666,9 +704,16 @@ class Selector:
 
         # A def or class header itself (signature, defaults, decorators, bases).
         if isinstance(s.node, (ast.FunctionDef, ast.AsyncFunctionDef)) and lo <= (s.node.body[0].lineno - 1):
-            got = m.line_tests(path, s.start, s.end)
-            got |= self.names_users(defined_names(s.node)) or set()
+            ran = m.line_tests(path, s.start, s.end)
+            got = ran | (self.names_users(defined_names(s.node)) or set())
             log(f"  {path}:{lo}: def header {s.node.name} -> {len(got)} tests")
+            if self.attrs is not None and s.func is None and path.startswith("sqlglot/"):
+                # A def at module or class level: it runs once, at import, and leaves a
+                # function object behind. Decided from what the patch changes once
+                # everything is imported; whoever ran the function's lines is the floor.
+                self.class_spots.append((f"<def {module_name(path)}.{s.node.name}>", set(), got, None))
+                self.header_floor |= ran
+                return set()
             return got
 
         if self.is_test_module(path):
@@ -723,6 +768,27 @@ class Selector:
                 return set()
             return old
 
+        old = self.module_level_older_rule(path, lo, s)
+        defined = defined_names(s.node)
+        targets_are_names = all(
+            isinstance(x, ast.Name)
+            for x in (getattr(s.node, "targets", None) or [getattr(s.node, "target", None)])
+        )
+        if self.attrs is not None and isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign)) and defined and targets_are_names:
+            # A module-level constant or table: decided with the class-level ones, from
+            # what the patch changes once everything is imported.
+            lam = None
+            for node in ast.walk(s.node):
+                if isinstance(node, ast.Lambda) and node.lineno <= lo and hi <= (node.end_lineno or node.lineno):
+                    if lam is None or (node.end_lineno - node.lineno) <= (lam.end_lineno - lam.lineno):
+                        lam = node
+            callers = None if lam is None else m.line_tests(path, lam.lineno, lam.end_lineno or lam.lineno)
+            self.class_spots.append((f"{module_name(path)}:", defined, old, callers))
+            return set()
+        return old
+
+    def module_level_older_rule(self, path: str, lo: int, s: Stmt) -> set[int] | None:
+        """A module-level statement, by who mentions the names it defines (the rule before)."""
         if isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             got = self.names_users(defined_names(s.node))
             if got is not None:
@@ -730,6 +796,38 @@ class Selector:
                 return got
         log(f"  {path}:{lo}: module-level {type(s.node).__name__} -> all")
         return ALL
+
+    def name_line_tests(self, name: str) -> set[int]:
+        """Tests that ran a function line mentioning `name` (as a name, an attribute or a
+        string): the only places a module global can be read at run time. Import-time
+        uses are not needed here: what they derive shows up in the import-state diff."""
+        if self._name_lines is None:
+            index: dict[str, set[tuple[str, int]]] = {}
+            for base in ("sqlglot", "tests"):
+                for file in sorted((SRC / base).rglob("*.py")):
+                    rel = file.relative_to(SRC).as_posix()
+                    try:
+                        tree = ast.parse(file.read_text(encoding="utf-8"))
+                    except (SyntaxError, UnicodeDecodeError, OSError):
+                        continue
+                    for fn in ast.walk(tree):
+                        if not isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef, ast.Lambda)):
+                            continue
+                        for node in ast.walk(fn):
+                            if isinstance(node, ast.Name):
+                                word = node.id
+                            elif isinstance(node, ast.Attribute):
+                                word = node.attr
+                            elif isinstance(node, ast.Constant) and isinstance(node.value, str) and node.value.isidentifier():
+                                word = node.value
+                            else:
+                                continue
+                            index.setdefault(word, set()).add((rel, node.lineno))
+            self._name_lines = index
+        out: set[int] = set()
+        for rel, line in self._name_lines.get(name, ()):
+            out |= self.m.line_tests(rel, line, line)
+        return out
 
     def class_level_older_rule(self, path: str, lo: int, s: Stmt, qual: str) -> set[int] | None:
         """A class-level statement, by who uses the class (the rule before the attribute map)."""
@@ -1073,6 +1171,9 @@ EARLYCUT = os.environ.get("BR_EARLYCUT", "1") == "1"
 EC_BACK = os.environ.get("BR_EC_BACK", "0") == "1"  # re-execute queries for back-half patches
 EC_PLAN_DIFFS = int(os.environ.get("BR_EC_PLAN_DIFFS", "0"))  # execute up to this many queries whose plan changed
 EC_PLAN_DIFF_CPU_S = float(os.environ.get("BR_EC_PLAN_DIFF_CPU", "3"))  # ...within this much baseline CPU
+# An edit to the TPC-DS fixture file itself: re-run the front half on the patched fixture.
+EC_FIXTURE = os.environ.get("BR_EC_FIXTURE", "1") == "1"
+TPCDS_FIXTURE_PATH = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
 EC_STAGE_PATH = Path(os.environ.get("BR_EC_STAGE", APP / "maps" / "tpcds_stage.json.gz"))
 EC_BASE_PATH = Path(os.environ.get("BR_EC_BASE", APP / "maps" / "tpcds_base.json"))
 # The whole batch has 180 s of wall time (270 s in the final). Every check, including
@@ -1128,6 +1229,10 @@ class EarlyCut:
         Only for patches whose every change is a statement inside a sqlglot function
         body (never import-time code), and only when the stage map knows where the
         test runs each of those functions."""
+        if EC_FIXTURE and selector.changed_paths == [TPCDS_FIXTURE_PATH] and TPCDS_FIXTURE_PATH in selector.data_sources:
+            # Only the TPC-DS fixture changed: the front half is re-run on the patched
+            # fixture with the pinned code. Nothing in the back half reads that file.
+            return True, set()
         if not selector.prerun_ok or not selector.runtime_spots or not selector.new_sources:
             return None
         front, queries = False, set()
@@ -1167,10 +1272,12 @@ class EarlyCut:
         if saving < EC_GAIN_FACTOR * cost + EC_GAIN_MARGIN_S:
             log(f"  early cutoff: not worth it (saves {saving:.1f}s, costs ~{cost:.1f}s; front={front}, {len(queries)} queries)")
             return numbers
-        diffs = EC_PLAN_DIFFS if (front and self.back_cpu) else 0
+        fixture_text = selector.data_sources.get(TPCDS_FIXTURE_PATH) if selector.changed_paths == [TPCDS_FIXTURE_PATH] else None
+        diffs = EC_PLAN_DIFFS if (front and self.back_cpu and fixture_text is None) else 0
         limit = cost + (EC_PLAN_DIFF_CPU_S + self.setup_cpu if diffs else 0.0)
         job = {
             "overrides": dict(selector.new_sources), "front": front, "queries": sorted(queries),
+            "fixture_text": fixture_text,
             "max_plan_diffs": diffs, "plan_diff_cpu_s": EC_PLAN_DIFF_CPU_S,
             # A patch that makes the code loop forever must not cost much: the child is
             # stopped at about twice the expected CPU (rlimit) or 4x the expected wall time.

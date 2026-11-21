@@ -35,7 +35,7 @@ IGNORED_NAMES = frozenset(("_abc_impl",))
 SKIP_GLOBAL_TYPES_FROM = frozenset(("typing", "typing_extensions", "logging", "_thread", "threading", "abc"))
 SKIP_GLOBAL_TYPES = (types.GenericAlias, types.UnionType)
 
-VERSION = 2
+VERSION = 4
 
 
 class StateFingerprinter(earlycut.Fingerprinter):
@@ -170,16 +170,70 @@ def import_everything() -> list[str]:
     return errors
 
 
-def class_state(src: str) -> tuple[dict[str, str], list[str], dict[str, dict[str, str]]]:
+def function_digest(fp: "StateFingerprinter", v) -> str:
+    """"F:<code>:<name, defaults, closure>" for a plain function (cached per object)."""
+    hit = _FUNC_CACHE.get(id(v))
+    if hit is not None and hit[0] is v:
+        return hit[1]
+    rest: list[str] = [f"{v.__module__}.{v.__qualname__}"]
+    fp.dump(v.__defaults__, set(), rest)
+    fp.dump(v.__kwdefaults__, set(), rest)
+    for cell in v.__closure__ or ():
+        try:
+            fp.dump(cell.cell_contents, set(), rest)
+        except ValueError:
+            rest.append("<empty cell>")
+    text = "F:" + fp.code_text(v.__code__) + ":" + hashlib.sha1("".join(rest).encode("utf-8", "surrogatepass")).hexdigest()[:16]
+    _FUNC_CACHE[id(v)] = (v, text)
+    return text
+
+
+def code_objects(value) -> list:
+    """The code objects that run when this attribute is used as a function: the function
+    itself, the functions inside a classmethod / staticmethod / property /
+    cached_property, and whatever a decorator's wrapper wraps (`__wrapped__`)."""
+    found, todo, seen = [], [value], set()
+    while todo and len(seen) < 12:
+        v = todo.pop()
+        if id(v) in seen or v is None:
+            continue
+        seen.add(id(v))
+        if isinstance(v, (classmethod, staticmethod)):
+            todo.append(v.__func__)
+        elif isinstance(v, property):
+            todo.extend((v.fget, v.fset, v.fdel))
+        elif isinstance(v, functools.cached_property):
+            todo.append(v.func)
+        elif isinstance(v, types.FunctionType):
+            found.append(v.__code__)
+            todo.append(getattr(v, "__wrapped__", None))
+        elif hasattr(v, "__wrapped__"):
+            todo.append(v.__wrapped__)
+    return found
+
+
+def class_state(src: str) -> tuple[dict[str, str], list[str], dict[str, dict[str, str]], dict]:
     """{"module.Qual:NAME": digest} for every attribute in the body of every sqlglot
-    class (dunders aside), after importing everything."""
+    class (dunders aside), and {"module::NAME": digest} for every module global, after
+    importing everything. Also the per-entry digests of tables of functions, and the
+    code object of every function-valued key (to say which lines a changed one covers)."""
     if src not in sys.path:
         sys.path.insert(0, src)
     errors = import_everything()
     fp = StateFingerprinter()
     state: dict[str, str] = {}
     entries: dict[str, dict[str, str]] = {}
+    codes: dict[str, list] = {}
+    digests: dict[int, tuple] = {}  # id(object) -> (object, digest): one dump per object
     seen: set[int] = set()
+
+    def digest_of(value) -> str:
+        hit = digests.get(id(value))
+        if hit is not None and hit[0] is value:
+            return hit[1]
+        text = fp.digest(value)
+        digests[id(value)] = (value, text)
+        return text
 
     def visit(cls: type) -> None:
         if id(cls) in seen or not getattr(cls, "__module__", "").startswith("sqlglot"):
@@ -194,6 +248,9 @@ def class_state(src: str) -> tuple[dict[str, str], list[str], dict[str, dict[str
             if (name.startswith("__") and name.endswith("__")) or name in IGNORED_NAMES:
                 continue
             try:
+                found = code_objects(value)
+                if found:
+                    codes[f"{owner}:{name}"] = found
                 state[f"{owner}:{name}"] = fp.digest(value)
                 if type(value) is dict:
                     detail = entry_digests(fp, value)
@@ -210,29 +267,37 @@ def class_state(src: str) -> tuple[dict[str, str], list[str], dict[str, dict[str
         for value in list(vars(mod).values()):
             if isinstance(value, type):
                 visit(value)
-    # Module-level data too ("module::NAME"): import-time code can derive a module
-    # constant from a class attribute. Each object once, under the first name that
-    # holds it; classes, functions and modules are not data.
-    dumped: set[int] = set()
+    # Module globals ("module::NAME"). Data under EVERY name that holds it (another
+    # module may import it under a different name, and tests find it by name);
+    # functions under the module that defines them; classes and modules are not data.
     for mod_name, mod in modules:
         for name, value in sorted(vars(mod).items()):
-            if (name.startswith("__") and name.endswith("__")) or id(value) in dumped:
+            if name.startswith("__") and name.endswith("__"):
                 continue
-            if isinstance(value, (type, types.ModuleType, types.FunctionType, types.BuiltinFunctionType)):
+            if isinstance(value, (type, types.ModuleType, types.BuiltinFunctionType)):
                 continue
             if type(value).__module__ in SKIP_GLOBAL_TYPES_FROM or isinstance(value, SKIP_GLOBAL_TYPES):
                 continue
-            dumped.add(id(value))
+            key = f"{mod_name}::{name}"
             try:
-                state[f"{mod_name}::{name}"] = fp.digest(value)
+                if isinstance(value, types.FunctionType):
+                    if value.__module__ == mod_name:
+                        state[key] = function_digest(fp, value)
+                        codes[key] = code_objects(value)
+                    continue
+                state[key] = digest_of(value)
+                if type(value) is dict:
+                    detail = entry_digests(fp, value)
+                    if detail is not None:
+                        entries[key] = detail
             except BaseException as e:  # noqa: BLE001
-                state[f"{mod_name}::{name}"] = f"!{type(e).__name__}"
-    return state, errors, entries
+                state[key] = f"!{type(e).__name__}"
+    return state, errors, entries, codes
 
 
 def cmd_baseline(src: str, out_path: str) -> int:
     cpu0 = time.process_time()
-    state, errors, entries = class_state(src)
+    state, errors, entries, _codes = class_state(src)
     if errors:
         print(f"class state: import errors at the pinned commit: {errors[:3]}", file=sys.stderr)
         return 1
@@ -269,7 +334,7 @@ def cmd_check(src: str, base_path: str) -> int:
             except Exception:  # noqa: BLE001
                 pass
         earlycut.install_overrides(src, job["overrides"])
-        state, errors, entries = class_state(src)
+        state, errors, entries, codes = class_state(src)
         if errors:
             verdict = {"ok": False, "why": f"import error: {errors[0]}"}
         else:
@@ -279,21 +344,44 @@ def cmd_check(src: str, base_path: str) -> int:
             # nothing else (same name, defaults and closure). Then the only way to see
             # the change is to CALL one of those functions.
             base_entries = raw.get("entries", {})
-            code_only = bool(changed)
-            for k in changed:
+
+            def only_bodies(k: str) -> bool:
                 old_e, new_e = base_entries.get(k), entries.get(k)
                 if old_e is None or new_e is None or set(old_e) != set(new_e):
-                    code_only = False
-                    break
+                    return False
                 for ek in old_e:
                     a, b = old_e[ek], new_e[ek]
                     if a != b and not (a.startswith("F:") and b.startswith("F:") and a.rsplit(":", 1)[1] == b.rsplit(":", 1)[1]):
-                        code_only = False
-                        break
-                if not code_only:
-                    break
+                        return False
+                return True
+
+            # What each changed key is: "code" = a table of functions where only bodies
+            # changed; "func" = a function (with the file and lines of its code);
+            # "data" = anything else.
+            kinds, ranges = {}, {}
+            root_dir = os.path.abspath(src) + os.sep
+            for k in changed:
+                if only_bodies(k):
+                    kinds[k] = "code"
+                elif k in codes and k in state:
+                    spans = []
+                    for co in codes[k]:
+                        filename = os.path.abspath(co.co_filename)
+                        lines = [ln for _, _, ln in co.co_lines() if ln is not None] + [co.co_firstlineno]
+                        if not filename.startswith(root_dir):
+                            spans = None  # code outside the sqlglot tree: nothing to look up
+                            break
+                        spans.append([filename[len(root_dir):].replace(os.sep, "/"), min(lines), max(lines)])
+                    if spans:
+                        kinds[k] = "func"
+                        ranges[k] = spans
+                    else:
+                        kinds[k] = "data"
+                else:
+                    kinds[k] = "data"
+            code_only = bool(changed) and all(v == "code" for v in kinds.values())
             verdict = {
-                "ok": True, "changed": changed, "code_only": code_only,
+                "ok": True, "changed": changed, "code_only": code_only, "kinds": kinds, "ranges": ranges,
                 "unstable_changed": sorted(k for k in changed if k in unstable),
                 "added": sorted(k for k in state if k not in base), "removed": sorted(k for k in base if k not in state),
             }

@@ -90,4 +90,5 @@ samples, and `tools/mutate/label.py` labels them by running the real suite in th
 | BB-5E85C0A3 | `1a9a77b` | `main`, `sub-01` | Coverage-map selector | 215.778 + 1.06 s, 0 | 216.8 |
 | BB-F7D24F70 | `1f0c94a` | `exp/probe`, `sub-02-probe` | + infection probe | 213.771 + 2.62 s, 0 | 216.4 |
 | BB-491EBE76 | `38923fa` | `exp/early-cutoff` | + early cutoff | 215.778 + 0.98 s, 0 | 216.8 |
-| (diagnostic) | `89112d3` | `diag/telemetry-1` | Same selections; reports how the selector classified the commits. Not a candidate. | | |
+| BB-F4BEB122 (diagnostic) | `89112d3` | `diag/telemetry-1` | Same selections; reports how the selector classified the commits. Not a candidate. | 218.877 + 53.03 s, 0 | 271.9 |
+| BB-EA6DA914 | `5b51ebc` | `exp/class-attrs` | + class-attribute selection | 202.814 + 5.65 s, 0 | 208.5 |

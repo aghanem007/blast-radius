@@ -215,13 +215,16 @@ def sha(data) -> str:
 # ---------------------------------------------------------------------- harness
 
 
-def front_half(src: str, on_item=None, hooks=None, only=None) -> dict:
+def front_half(src: str, on_item=None, hooks=None, only=None, fixture_text=None) -> dict:
     """Run the front half of test_execute_tpcds exactly as the test does, in the
     test's order, and fingerprint what it hands to the back half.
 
     on_item(key, value) is called for each fingerprint as it is produced and may
     raise StopIteration to end early. hooks.back(i, table names, plan) is called for
-    every executed query once its plan exists. only: restrict to these query numbers."""
+    every executed query once its plan exists. only: restrict to these query numbers.
+    fixture_text: use this text as the TPC-DS fixture file instead of the pinned one
+    (read through the test suite's own loader, so comments, metadata lines and the
+    statement split are handled exactly as the test handles them)."""
     import pickle
 
     if src not in sys.path:
@@ -267,7 +270,25 @@ def front_half(src: str, on_item=None, hooks=None, only=None) -> dict:
             emit(key, f"!{type(e).__name__}: {e}"[:300])
             return None
 
-    sqls = [(i, meta, sql) for i, (meta, sql, _) in enumerate(load_sql_fixture_pairs(FIXTURE)) if only is None or i in only]
+    if fixture_text is None:
+        pairs = list(load_sql_fixture_pairs(FIXTURE))
+    else:
+        import tempfile
+
+        import tests.helpers as helpers
+
+        with tempfile.TemporaryDirectory() as tmp:
+            target = os.path.join(tmp, *FIXTURE.split("/"))
+            os.makedirs(os.path.dirname(target))
+            with open(target, "w", encoding="utf-8", newline="") as f:
+                f.write(fixture_text)
+            saved = helpers.FIXTURES_DIR
+            helpers.FIXTURES_DIR = tmp
+            try:
+                pairs = list(helpers.load_sql_fixture_pairs(FIXTURE))
+            finally:
+                helpers.FIXTURES_DIR = saved
+    sqls = [(i, meta, sql) for i, (meta, sql, _) in enumerate(pairs) if only is None or i in only]
     try:
         # 1. the main process: parse every query and pickle it for the pool
         blobs: dict = {}
@@ -477,7 +498,7 @@ def cmd_check(src: str, base_path: str, job_path: str) -> int:
             first_diff.append((key, value[:120] if value.startswith("!") else "differs"))
             raise StopIteration
 
-        items = front_half(src, on_item=on_item, hooks=hooks, only=only)
+        items = front_half(src, on_item=on_item, hooks=hooks, only=only, fixture_text=job.get("fixture_text"))
         expected = [
             k for k in base
             if not k.endswith(".result") and (only is None or int(k.split(".")[0]) in only)

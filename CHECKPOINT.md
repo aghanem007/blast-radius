@@ -277,6 +277,60 @@ clean `--no-cache` build 44 s. Tricky set 11 of 12: 0 misses.
   class-level edits and def headers. Needs the 30 labels (`work/label_mod.json`, 2 done, labeling was paused) before use.
   Both patch scripts apply on top of the candidate's files; apply them in a copy, test, then port.
 
+## 13. Practice result of the class-attribute build (BB-EA6DA914, Sat 4:53 AM): 208.5 s, new best
+
+Commit `5b51ebca1dfb5183e13d7889528fee8727169d19` (branch `exp/class-attrs`, pushed), submitted by Claude through the signed-in
+built-in browser under the user's "Yes, if it's clean". All 3 runs: **202.814 s simulated, 5.65 / 5.59 / 5.69 s CPU, 0 missed**.
+- vs 38923fa / sub-01: simulated 215.778 -> 202.814 (-13.0 s), CPU 0.98 -> 5.65 (+4.7 s, about 3-4 class checks), score
+  216.8 -> **208.5**. The page now says the pick BB-5E85C0A3 "is not your best score: BB-EA6DA914 scored better";
+  **the final pick is still BB-5E85C0A3** (not changed; that is the user's decision). Next slot 5:53 AM.
+- So class-level ASSIGNMENTS were only a small part of the diagnostic's 99 s bucket on practice. The rest of that bucket is
+  some mix of: module-level constants, def headers, class-level statements that are not plain assignments, patches that mix a
+  class-level edit with other Python changes, and class attributes nearly every test reads (still ~36 s each).
+- Working branch now: **`exp/module-level`** (from 5b51ebc, uncommitted): `patch_fixture.py` and `patch_module.py` applied
+  (TPC-DS fixture mode of the early cutoff; module-level assignments through the import-state check; class-state VERSION 3).
+  No regression on the 120 class-level labels (0 misses, 938.1 s). Labels being made, one labeler at a time:
+  `work/label_cls_adv.json` (x12), `work/label_mod.json` (30 module-level), `work/label_fx.json` (18 TPC fixture mutants).
+- Idea for a second diagnostic if needed: split what is left of the class bucket (module constant / def header / deferred but
+  still expensive / other class-level) the same way as section 9's diagnostic.
+
+## 14. Branch `exp/module-level` (Sat ~06:00 ET): three more import-time kinds, validated, NOT committed or submitted
+
+No user answer yet to "May I keep submitting builds each hour while you're away?", so nothing new was committed, pushed or
+submitted after BB-EA6DA914. Everything below sits in the working tree of `exp/module-level` (on top of 5b51ebc).
+
+**What the branch adds** (scripts that produced it, applied in this order: `work/exp_fronthalf/patch_fixture.py .`,
+`patch_module.py .`, `patch_header.py .`; class-state baseline VERSION 4):
+1. **Module-level assignments** (constants, tables such as `sqlglot/typing/*.py`, `executor/env.py`): deferred like class-level
+   ones and decided from the import-state diff. A changed function -> tests that ran its lines; a changed module global holding
+   data -> tests that ran a function line mentioning its name (static scan, `name_line_tests`); bodies of functions in a
+   module-level table -> tests that ran those lambdas' lines; anything unobservable -> every test.
+2. **Function headers** (signature, defaults, decorators) of defs at module or class level: same check; the tests that ran any
+   line of the edited def are always included; a changed function object (or the wrapper around it) -> tests that ran its lines.
+3. **TPC-DS fixture file**: the early cutoff's front half is re-run on the patched fixture (`BR_EC_FIXTURE`).
+
+**Why it matters (real labels, full suite in br-mapper):**
+| Set (random single-token mutants, file-uniform) | Old rule: cost, misses | Branch: cost, misses |
+| --- | --- | --- |
+| 30 module-level (`work/mutants_mod`, `label_mod.json`) | 774.2 s, **2 MISSES** (g51005 left out 157 of 171 failing tests; g51010 366 of 1419) | 461.4 s, 0 |
+| 30 function-header (`work/mutants_hdr`, `label_hdr.json`) | 770.5 s, 0 | 438.0 s, 0 |
+| 18 TPC fixture (`work/mutants_fx`, `label_fx.json`) | 458.2 s, 0 | 381.5 s, 0 |
+| 120 class-level, 12 tricky class-level | unchanged vs 5b51ebc: 938.1 s / 245.0 s | 0 misses (older rule misses 3 tricky) |
+| 135 older labeled patches | | 1864.8 s, 0 misses |
+- The old rule's 2 misses on 30 random module-level mutants are the important part: **every build submitted so far, including
+  the final pick BB-5E85C0A3 and BB-EA6DA914, can miss on a module-level edit** (about 7% of them here). None of the 40 practice
+  commits triggered it. Module-level lines are ~8% of sqlglot's lines, headers ~10%, class-level ~27%.
+- Fixture labels confirm the reading of the test code: a tpc-ds.sql edit fails `test_tpcds` and sometimes `test_execute_tpcds`,
+  never the other 59 TestExecutor tests the reads map selects (possible further saving: 10.1 -> ~4.2 s).
+- Sandbox with the image built from the staged tree before the header change (f170df7d): every set 0 misses; samples
+  148.453 + 9.95 s CPU. Must be redone for the final tree (header handling was added afterwards).
+
+**Final check of the whole branch (06:09, image `br-ml` built from the staged tree 52f5d3c9):** sandbox, 0 misses on every set:
+samples 148.453 + 10.1 s CPU = 158.5; module 30: 461.44 + 28.4; header 30: 438.024 + 31.3; fixture 18: 381.477;
+class 120: 938.139; tricky 12: 245.049; eval_big 906.62 (was 1015.0 on 5b51ebc); eval_proxy 298.289; eval_rare 403.028.
+**It is staged, not committed.** Waiting for the user's go-ahead to commit, push and submit (slot open since 5:53 AM).
+Suggested commit message: "Module-level assignments, function headers and the TPC-DS fixture through the import-state check".
+
 # >>> END OF HANDOFF. Full history below. <<<
 
 
