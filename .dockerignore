@@ -1,0 +1,7 @@
+# Keep the build context small: the scorer image only needs selector.py and maps/.
+work/
+sample/
+tools/
+docs/
+*.jsonl
+.git/
