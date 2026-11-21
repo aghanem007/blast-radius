@@ -678,11 +678,18 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
 
 # Off by default (review, Nov 20): accurate (617 audited verdicts, 0 errors) but it saved
 # ~2 s over 73 patches while adding forks, test packages and a time-budget risk.
-PRERUN = os.environ.get("BR_PRERUN", "0") == "1"
+PRERUN = os.environ.get("BR_PRERUN", "1") == "1"  # exp/probe: the forked runner hosts the probe
 ELIDE_BIG = os.environ.get("BR_ELIDE", "0") == "1"  # giant-test skip: off until the data supports it
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"  # validation: log the runner's verdict on every cheap candidate
 PROBE_AUDIT = os.environ.get("BR_PROBE_AUDIT", "0") == "1"  # validation: log infection-probe results
-PROBE = os.environ.get("BR_PROBE", "0") == "1"  # infection probe: off until audited on enough patches
+PROBE = os.environ.get("BR_PROBE", "1") == "1"  # exp/probe: infection probe on (practice experiment)
+PROBE_TRIGGER = 0.5  # probe only when its estimated CPU is at most this share of the scheduling cost
+PROBE_BUDGET = 0.7  # and stop it once it has used this share of the scheduling cost in CPU
+CHEAP_RUN = os.environ.get("BR_CHEAP_RUN", "0") == "1"  # the cheap-test runner stays off: probe alone
+WALL_BUDGET_S = 90  # never start a probe after this much wall time (batch limit 180 s / 270 s final)
+import time as _time
+
+_START = _time.monotonic()
 PROBE_MIN_REACHED = 10
 CHEAP_MS = 1500  # tests at most this long may be run by us; longer ones are scheduled
 PRERUN_OVERHEAD_MS = 40  # fork and code swap, per patch
@@ -792,11 +799,11 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
             order = sorted(cheap, key=lambda n: COSTS.test_ms(nodeid_of[n]))
             probe_cost = COSTS.run_ms([nodeid_of[n] for n in order])
             schedule_cost = commit_cost_ms(numbers, ms)
-            if probe_cost < schedule_cost:
+            if probe_cost <= PROBE_TRIGGER * schedule_cost and _time.monotonic() - _START < WALL_BUDGET_S:
                 cpu0 = _cpu()
                 out = prerun.probe_run(
                     runner, path, plan, [nodeid_of[n] for n in order], 15 + 3 * probe_cost / 1000,
-                    cpu_budget_s=0.8 * schedule_cost / 1000,
+                    cpu_budget_s=PROBE_BUDGET * schedule_cost / 1000,
                 )
                 COSTS.imported |= {nodeid_of[n].split("::", 1)[0] for n in order}
                 cpu1 = _cpu()
@@ -809,6 +816,9 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
                     return []
             else:
                 log(f"  probe: not worth it (probe ~{probe_cost / 1000:.1f}s vs schedule {schedule_cost / 1000:.1f}s)")
+
+    if not CHEAP_RUN and not (PROBE_AUDIT or AUDIT or ELIDE_BIG):
+        return numbers  # exp/probe: no cheap-test runner, only the probe above
 
     if PROBE_AUDIT:
         # Validation only: run an infection probe over the cheap candidates and log
