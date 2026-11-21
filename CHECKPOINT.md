@@ -165,6 +165,41 @@ Submission BB-F7D24F70 = exp/probe @ 1f0c94a (tag sub-02-probe): **216.4 s**, 0 
 under load vs 600 s), forks and test packages. DECISION PENDING USER: switch the final entry back to BB-5E85C0A3
 (the page auto-entered BB-F7D24F70 as "best score").
 
+## Waste by slow test (182 labeled patches, baseline)
+
+test_execute_tpcds: selected 74, failed 22, wasted 882 s (mostly function-body edits); no safe fix found
+(proxy refuted, slicing rejected, probe gain only 0.4 s on practice).
+test_generator_memory: selected 31, failed 0, wasted 164 s (149 s from class-level dialect edits) -> NEXT EXPERIMENT.
+
+## NEXT EXPERIMENT: test_generator_memory, affected dialects only (approved by user Sat ~00:30)
+
+Goal: for a class-level edit in a dialect class, instead of scheduling test_generator_memory (6.7 s), run its REAL
+logic ourselves (tests/test_generator.py::TestGenerator::test_generator_memory: for each dialect, build 100 generators,
+gc, tracemalloc 1000 more, assertLess(after-before, 1024)) for only the affected dialects, against the PATCHED code.
+- Branch: new `exp/genmem` from review/wip. Never touch selector/v2 (sub-01 @ 1a9a77b) or exp/probe (sub-02-probe @ 1f0c94a).
+- Class-level edits can't be hot-swapped: run a subprocess with a patched sqlglot copy in /tmp (sqlglot pkg ~3.5 MB,
+  /tmp is 64 MB) first on PYTHONPATH, then call the real test method with `Dialects` restricted to affected dialects
+  (or run all dialects if unsure). Keep tracemalloc leak detection exactly as the test does it.
+- Affected dialects: any dialect whose Dialect/Tokenizer/Parser/Generator class has the edited class in its MRO, PLUS any
+  dialect whose classes copy the edited attribute at import (e.g. KEYWORDS = {**Other.Tokenizer.KEYWORDS}). If unsure,
+  fall back to scheduling the test (never guess).
+- Measure: real CPU per affected-dialect check in the scorer sandbox; score vs baseline on all labeled sets
+  (sample, work/eval_big, eval_exotic, eval_adv, eval_proxy, eval_rare).
+- Adversarial bugs to write and label (tools/mutate/label.py): dialect inheritance (edit a parent dialect's generator
+  setting), shared settings copied across dialects, generator __init__ / construction code, a leak (e.g. a class-level
+  list that grows per generator), and an exception in construction for one dialect only.
+- Enable only if 0 misses on all labels + adversarial AND net CPU savings are real. Then practice-submit, and still
+  choose the final deliberately.
+- Image: the baseline image has no test packages; test_generator.py must import without duckdb/pandas (check its imports;
+  if it needs packages, measure the build time, which must stay far below 600 s).
+
+## CHECKLIST before Sun 11:00 AM ET
+
+- [ ] Find the control on the signed-in submissions panel to choose the final entry; select BB-5E85C0A3 (baseline,
+      1a9a77b) unless we decide otherwise. Probe BB-F7D24F70 (216.4 s) is currently auto-entered as "best score".
+      If no control exists: ask organizers in the event chat to set the final to BB-5E85C0A3.
+- [ ] Keep the repo public; never rewrite submitted commits (1a9a77b, 1f0c94a).
+
 ## FINAL ENTRY RULE
 
 The final defaults to the best practice score. The verified baseline is **sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9**
