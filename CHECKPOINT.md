@@ -102,6 +102,19 @@ kills it if it's still running.
   `__name__ != "__main__"` in tests/test_docs.py crashed the pytest session; we had selected 0).
   **Submit candidate: selector/v2 @ 439b5e4b47a01e24242d4dd8a1db3aa44bb215b0.** 0 misses on 125 labeled patches.
 
+## TPC-DS slicing experiment (Nov 20 ~23:45): REJECTED
+
+Per-query coverage + CPU (tools/tpcds_slice, branch exp/tpcds-slice; data in work/tpcds). Running all 99
+TPC-DS queries ourselves costs 75.7 s CPU + 5.4 s setup; 30 of 37 labeled patches that select the test
+reach all 57 executing queries (slice ~80 s vs ~23.5 s to schedule). Only m07038c would gain (~17 s).
+Decision: do not implement; submit the verified version.
+
+## Submission target (user's own repo, no Claude trailers)
+
+Repo https://github.com/aghanem007/blast-radius (PRIVATE until the user approves going public).
+Submit commit: selector/v2 = main = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9 (verified: fresh clone,
+clean build, samples 174.5 s, 0 misses). selector/v2 has not changed since.
+
 ## Next steps (in order)
 
 1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
