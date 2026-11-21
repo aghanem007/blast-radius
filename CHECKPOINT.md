@@ -10,7 +10,7 @@ the earliest submission).
 | --- | --- |
 | Local repo | `C:\Users\Welco\Desktop\Hackathon\blast-radius` |
 | Remote (shared with Sergio) | https://github.com/Sergio33113/hackathon-1 (`origin`). **PRIVATE: must be made public to submit** |
-| **Current working version (submit candidate)** | branch `selector/v2`, commit `e031ecbe0e4889a4af95727d4606a4c3fb3c438c`. Map only plus runner (prerun on by default in code; see decisions) |
+| **Current working version (submit candidate)** | branch `selector/v2` HEAD (see `git log -1 selector/v2`); review fixes shipped Nov 20 ~22:40. Previous: `e031ecbe0e4889a4af95727d4606a4c3fb3c438c`. Map only plus runner (prerun on by default in code; see decisions) |
 | Review work in progress | branch `review/wip`, commit `4c9f9fc57735c645fd9c2de2ad0376f7cca02bca` (current checkout) |
 | Not yet submitted | Nothing has been submitted on the track page |
 | Strategy doc | https://claude.ai/artifact/S9GLzXzdo6H9Zxwvb26wyK |
@@ -89,13 +89,22 @@ kills it if it's still running.
 - Labeler, adversarial: `work/adv` -> `work/label_adv.json` (adv2, adv3 done; adv1 pending).
 - Cold candidate recording + union map: -> `work/out_cold`, `work/out_union`, `maps_candidate/map.json.gz`.
 
+## Shipped on selector/v2 (Nov 20 ~22:40)
+
+- C3 fix: cold-cache union map promoted to `maps/map.json.gz`.
+- C1 fix: exact constant comparison.
+- Runner (prerun) off by default; Dockerfile no longer installs test packages (build only fetches sqlglot).
+- Insurance: pytest/packaging config -> all (P2), `sqlglotc/**` -> its 3 tests, answers on a private stdout fd (P4),
+  registry attributes `key`/`_sql_names` -> all (P5).
+- Verified in the scorer sandbox: 0 misses on 121 labeled patches; samples 174.5 s + ~1.4 s CPU; `run_sample.py` format ok.
+
 ## Next steps (in order)
 
-1. When the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
+1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
    (b) re-run `cold_check.py` against `maps_candidate` (gaps should drop to ~0 outside import lines);
    (c) score all labeled sets + `work/eval_adv` with `BR_MAP=maps_candidate/map.json.gz`: must be 0
    misses, including **adv2_tryload**; record the score cost.
-2. If it holds: promote the candidate map to `maps/`, fold C1 in, set prerun/probe default off, and
+2. DONE. Was: if it holds, promote the candidate map to `maps/`, fold C1 in, set prerun/probe default off, and
    (optionally) drop the requirements install from the Dockerfile. Commit on `selector/v2`, verify with
    `run_sample.py`, tag `sub-01`.
 3. Sergio makes the repo public; submit `selector/v2` HEAD on the track page; log it in the README table.

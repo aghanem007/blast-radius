@@ -39,8 +39,13 @@ MAX_WORKERS = 8
 WORKER_COST_MS = 2000
 ALL = None  # sentinel: select every test
 
-# Config files that change how pytest itself runs.
-PYTEST_CONFIG = {"pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py"}
+# Config files that can change how pytest itself runs (pytest reads its settings from
+# pyproject.toml / setup.cfg / tox.ini / pytest.ini, before any test can record a read).
+PYTEST_CONFIG = {"pytest.ini", "tox.ini", "conftest.py", "tests/conftest.py", "pyproject.toml", "setup.cfg"}
+
+# Class attributes that register a class under a name other classes are looked up by
+# (an expression's key, a function's SQL names): an edit can break *other* classes' tests.
+REGISTRY_ATTRS = {"key", "_sql_names", "sql_names"}
 
 
 def log(*args) -> None:
@@ -419,6 +424,10 @@ class Selector:
     # ---- data files (fixtures, docs, config)
     def data_file(self, path: str, fp: FilePatch) -> set[int]:
         out: set[int] = set()
+        if path.startswith("sqlglotc/"):
+            # test_sqlglotc builds the sqlglotc package; setuptools reads its files in
+            # ways our read map may not see (pyproject.toml, MANIFEST.in).
+            out |= self.whole_test_file("tests/test_sqlglotc.py")
         for p in {fp.old_path, fp.new_path} - {None}:
             got = self.m.set_of(self.m.reads, p)
             if got:
@@ -576,6 +585,9 @@ class Selector:
         cls_path = s.cls
         if isinstance(s.node, ast.ClassDef):
             cls_path = f"{s.cls}.{s.node.name}" if s.cls else s.node.name
+        if cls_path is not None and defined_names(s.node) & REGISTRY_ATTRS:
+            log(f"  {path}:{lo}: registry attribute {sorted(defined_names(s.node) & REGISTRY_ATTRS)} -> all")
+            return ALL
         if cls_path is not None:
             qual = f"{module_name(path)}.{cls_path}"
             users = m.set_of(m.classes, qual)
@@ -863,7 +875,21 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
 # --------------------------------------------------------------------------- main
 
 
+def private_stdout():
+    """Keep the answer channel to ourselves.
+
+    Anything else that writes to stdout (a library warning, an import-time print)
+    would corrupt the answers and reject the run. Duplicate the real stdout for our
+    answers, then point file descriptor 1 and sys.stdout at stderr."""
+    sys.stdout.flush()
+    answers = os.fdopen(os.dup(1), "w", encoding="utf-8", newline="\n")
+    os.dup2(2, 1)
+    sys.stdout = sys.stderr
+    return answers
+
+
 def main() -> None:
+    answers = private_stdout()
     tests = json.loads((DATA / "tests.json").read_text())["tests"]
     ms = {t["number"]: round(t["seconds"] * 1000) for t in tests}
     all_numbers = [t["number"] for t in tests]
@@ -918,8 +944,8 @@ def main() -> None:
                     log(f"  prerun error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
-        print(json.dumps({"commit": patch.stem, "workers": workers}))
-        sys.stdout.flush()
+        answers.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
+        answers.flush()
 
 
 if __name__ == "__main__":
