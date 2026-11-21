@@ -72,6 +72,15 @@ as "all fail".
 - Never use other teams' code. Map data only from the pinned commit; labels are never shipped.
 - Accuracy over speed: a miss costs 300 s, so anything uncertain selects more.
 
+## Labeler hang (fixed ~22:00)
+
+Some mutants loop forever inside the suite's own process-pool workers, where pytest's
+per-test timeout can't reach (`m07013c` ran 3+ hours on ~6 cores). `label.py` now bounds each
+run at 40 min, kills the container, and records the patch in `<out>.unlabelable.json` (never a
+guessed label). `m07013c` is recorded unlabelable. The slow-test labeler was restarted with this
+code (it resumes from saved labels). `adv1_dispatch` (old labeler code) has a 30-min watchdog that
+kills it if it's still running.
+
 ## Background jobs at checkpoint time
 
 - Labeler, slow-test fake bugs: `work/mutants_big` -> `work/label_big.json` (~41/80; old process, old

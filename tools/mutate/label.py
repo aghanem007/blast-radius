@@ -57,8 +57,9 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
         dest.parent.mkdir(parents=True, exist_ok=True)
         dest.write_text(content, encoding="utf-8", newline="\n")
         mounts += ["-v", f"{dest}:/sqlglot/{rel}:ro"]
+    name = f"label-{cid}-{os.getpid()}"
     cmd = [
-        DOCKER, "run", "--rm", "--platform", "linux/amd64",
+        DOCKER, "run", "--rm", "--name", name, "--platform", "linux/amd64",
         "-v", f"{case / 'out'}:/out",
         "-v", f"{ROOT / 'tools' / 'mutate'}:/m:ro",
         "-e", "PYTHONPATH=/sqlglot:/m", "-e", "FAIL_OUT=/out",
@@ -69,7 +70,14 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
         "-n", str(jobs), "-q", "--timeout", "600",
     ]
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
-    proc = subprocess.run(cmd, capture_output=True, text=True, env=env)
+    try:
+        # A mutant can loop forever inside the suite's own process-pool workers, where
+        # pytest's per-test timeout cannot reach. Bound the whole run instead; a run
+        # that hits this limit is UNLABELABLE, never given a guessed label.
+        proc = subprocess.run(cmd, capture_output=True, text=True, env=env, timeout=RUN_LIMIT_S)
+    except subprocess.TimeoutExpired:
+        subprocess.run([DOCKER, "kill", name], capture_output=True)
+        raise Unlabelable(f"{cid}: suite still running after {RUN_LIMIT_S // 60} min (likely an infinite loop)")
     (case / "pytest.log").write_text(proc.stdout + proc.stderr, encoding="utf-8")
 
     failed, broken = set(), set()
@@ -88,6 +96,11 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
 
 
 SUSPECT = ("BrokenProcessPool", "MemoryError", "Killed", "node down", "worker crashed")
+RUN_LIMIT_S = 40 * 60
+
+
+class Unlabelable(RuntimeError):
+    pass
 
 
 _BASELINE: dict | None = None
@@ -139,13 +152,23 @@ def main() -> None:
     jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else 14
     parallel = int(sys.argv[sys.argv.index("--parallel") + 1]) if "--parallel" in sys.argv else 1
     answers = json.loads(out_path.read_text())["commits"] if out_path.exists() else {}
-    todo = [p for p in sorted(patch_dir.glob("*.patch")) if p.stem not in answers]
+    skipped_path = out_path.with_suffix(".unlabelable.json")
+    skipped = json.loads(skipped_path.read_text()) if skipped_path.exists() else {}
+    todo = [p for p in sorted(patch_dir.glob("*.patch")) if p.stem not in answers and p.stem not in skipped]
     lock = threading.Lock()
 
     def run(patch: Path) -> None:
         t0 = time.time()
         try:
             got = label_checked(patch.stem, patch.read_text(encoding="utf-8"), jobs)
+        except Unlabelable as e:
+            print(f"{patch.stem}: UNLABELABLE {e}", file=sys.stderr, flush=True)
+            with lock:
+                skipped = out_path.with_suffix(".unlabelable.json")
+                seen = json.loads(skipped.read_text()) if skipped.exists() else {}
+                seen[patch.stem] = str(e)
+                skipped.write_text(json.dumps(seen, indent=1))
+            return
         except Exception as e:
             print(f"{patch.stem}: ERROR {e}", file=sys.stderr, flush=True)
             return
