@@ -118,7 +118,7 @@ clean build, samples 174.5 s, 0 misses). selector/v2 has not changed since.
 ## SUBMITTED (Nov 20, late night)
 
 sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9 on https://github.com/aghanem007/blast-radius (now PUBLIC).
-Practice board: **216.8 s, rank 41**. 0 misses (any miss alone would add 300 s). Tag `sub-01` pushed.
+Practice board: **216.8 s, rank 41** (submission BB-5E85C0A3, Fri 10:32 PM). All 3 runs: 215.778 s simulated, ~1.06 s CPU, 0 commits missed. Marked "Entered in the final (your best score)". Tag `sub-01` pushed.
 Keep the repo public and never rewrite this commit until results are published.
 
 ## test_execute_tpcds investigation (Nov 21, early)
