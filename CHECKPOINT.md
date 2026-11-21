@@ -115,6 +115,12 @@ Repo https://github.com/aghanem007/blast-radius (PRIVATE until the user approves
 Submit commit: selector/v2 = main = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9 (verified: fresh clone,
 clean build, samples 174.5 s, 0 misses). selector/v2 has not changed since.
 
+## SUBMITTED (Nov 20, late night)
+
+sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9 on https://github.com/aghanem007/blast-radius (now PUBLIC).
+Practice board: **216.8 s, rank 41**. 0 misses (any miss alone would add 300 s). Tag `sub-01` pushed.
+Keep the repo public and never rewrite this commit until results are published.
+
 ## Next steps (in order)
 
 1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
