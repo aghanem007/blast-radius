@@ -121,6 +121,16 @@ sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9 on https://github.com/aghanem0
 Practice board: **216.8 s, rank 41**. 0 misses (any miss alone would add 300 s). Tag `sub-01` pushed.
 Keep the repo public and never rewrite this commit until results are published.
 
+## test_execute_tpcds investigation (Nov 21, early)
+
+Waste breakdown on 126 labeled patches: 849 s total vs perfect; 530 s is test_execute_tpcds scheduled needlessly.
+- Proxy (test_tpcds as stand-in): REFUTED by adversarial m21001c (execute_tpcds fails, test_tpcds passes).
+  836 lines run by execute_tpcds are never run by test_tpcds.
+- Provably-safe edit classes: none worth it (needless cases are logic edits: is/==, copy=, defaults, conditions).
+- Infection probe (full coverage, experiment image br-exp, tools/audit_probe.py, results work/probe_audit.json):
+  no trigger -121 s; trigger est<=0.4-0.7x schedule +33..+41 s over 126 patches; 6/6 harmless verdicts correct.
+  PENDING: 20 rare-input adversarial bugs (work/mutants_rare -> work/label_rare.json) must be audited before any decision.
+
 ## Next steps (in order)
 
 1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
