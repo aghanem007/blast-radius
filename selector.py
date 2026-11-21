@@ -572,6 +572,18 @@ class Selector:
             return got
 
         if self.is_test_module(path):
+            # A test module's top-level statement runs when pytest imports the file. A
+            # definition or constant only affects that file's tests, but a statement that
+            # runs code (`if __name__ ...: unittest.main()`, a call, an import, a loop) can
+            # exit or crash the whole pytest session: every test.
+            top = s
+            while top.parent is not None and not isinstance(top.parent.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                top = top.parent
+            if top.func is None and not isinstance(
+                top.node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef, ast.Assign, ast.AnnAssign)
+            ):
+                log(f"  {path}:{lo}: test module top-level {type(top.node).__name__} runs at import -> all")
+                return ALL
             got = self.whole_test_file(path)
             log(f"  {path}:{lo}: test module import-time code -> its {len(got)} tests")
             return got
