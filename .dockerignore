@@ -1,5 +1,5 @@
-# Keep the build context small: the scorer image only needs selector.py, prerun.py,
-# requirements.lock and maps/.
+# Keep the build context small: the scorer image only needs the top-level Python
+# files (selector.py, classstate.py, earlycut.py, prerun.py, probe.py) and maps/.
 work/
 sample/
 tools/

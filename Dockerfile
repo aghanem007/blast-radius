@@ -17,7 +17,7 @@ RUN mkdir -p /app/src \
     && tar -xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 \
     && rm /tmp/sqlglot.tar.gz
 
-COPY selector.py prerun.py probe.py earlycut.py /app/
+COPY selector.py prerun.py probe.py earlycut.py classstate.py /app/
 COPY maps/ /app/maps/
 
 # Bytecode for the pinned source (the run's disk is read-only, so it cannot be cached
@@ -27,6 +27,8 @@ COPY maps/ /app/maps/
 RUN python -m compileall -q /app/src/sqlglot /app/src/tests/__init__.py /app/src/tests/helpers.py \
     ; (PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python /app/earlycut.py baseline /app/src /app/maps/tpcds_base.json \
        || echo "early-cutoff baseline not built") \
+    ; (PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python /app/classstate.py baseline /app/src /app/maps/class_state.json \
+       || echo "class-state baseline not built: class-level changes use the older rule") \
     ; chmod -R a+rX /app
 # The run is as user nobody on a read-only disk: everything must be world-readable.
 

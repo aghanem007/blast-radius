@@ -1,4 +1,4 @@
-# Checkpoint: Blast Radius (team 2696). Updated Sat 2026-11-21 ~01:00 ET
+# Checkpoint: Blast Radius (team 2696). Updated Sat 2026-11-21 ~03:15 ET (sections 2, 3 and 7-9 are the newest)
 
 # >>> START HERE: NEW-CHAT HANDOFF (written for a fresh Claude with no memory) <<<
 
@@ -23,19 +23,24 @@
   runs. Lower is better. Ties within 1 s go to the earliest submission. Rules: `docs/SCORING.md`, `docs/KIT_README.md`; exact scorer: `score.py`.
 - Three tests dominate the cost: test_max_nodes 28.8 s, **test_execute_tpcds 21.5 s**, test_generator_memory 6.7 s.
 
-## 2. Current state (Sat ~01:00 ET)
-| Submission | Commit / tag | Practice score (40 commits) | Status |
+## 2. Current state (Sat ~03:15 ET). The newest detail is in sections 7, 8 and 9.
+| Submission | Commit, branch / tag | Practice score (40 commits) | Status |
 | --- | --- | --- | --- |
-| BB-5E85C0A3 baseline | `1a9a77b` = selector/v2 = main, tag sub-01 | 216.8 s, 0 misses x3 | **THE FINAL PICK** (set manually by the user Sat ~00:30) |
-| BB-F7D24F70 probe | `1f0c94a` = exp/probe, tag sub-02-probe | 216.4 s, 0 misses x3 | not picked (0.4 s is noise; risky build) |
+| BB-5E85C0A3 baseline | `1a9a77b` = selector/v2 = main, tag sub-01 | 216.8 s, 0 misses x3 | **THE FINAL PICK** (set by the user; unchanged) |
+| BB-F7D24F70 probe | `1f0c94a` = exp/probe, tag sub-02-probe | 216.4 s, 0 misses x3 | not picked |
+| BB-491EBE76 early cutoff | `38923fa` = exp/early-cutoff | 216.8 s, 0 misses x3 | identical to baseline: no practice commit qualified |
+| diagnostic | `89112d3` = diag/telemetry-1 | (to be submitted in the 3:26 AM slot) | never a candidate; decode with `work/exp_fronthalf/decode_diag.py` |
 
-First place is about **150 s** (per the user; our last recorded board had 186.2 on top). We were around rank 41.
-Notes and working state are on branch `review/wip` (this file). The genmem experiment was STOPPED (see further down).
+Board (195 teams): we are rank 83; first is 138.1 s; about 30 teams sit between 172 and 186 s. This PC is on Eastern time.
+Working branch: **`exp/class-attrs`** (uncommitted work on top of 38923fa): class-attribute selection, the likely practice gap.
+Tools on this PC: Git, Docker Desktop, venv `work\.venv`, images `br-mapper` (labeling, full suite in ~70-90 s per patch),
+`br-ca` (current tree), `blast-radius-entry` and `:v1`.
 
 ## 3. WHAT THE USER WANTS NOW
-Compete for first place: find a realistic way to cut **40–60 s** off the practice score **without major miss risk**. Keep the verified
-submissions untouched, experiment on new branches, and decide what to submit from measured results.
-Deliverable: an honest assessment of what's achievable before the deadline, then build the best idea on an `exp/*` branch if the user agrees.
+Compete for first place: cut the practice score substantially **without major miss risk**. Keep the verified submissions untouched,
+experiment on new branches, decide what to submit from measured results. The user has said: commit/push/submit need their go-ahead
+each time (they approved committing and pushing 38923fa, and submitting the diagnostic through the signed-in built-in browser),
+do not read or use other teams' code, and tidying the repo and files is welcome.
 
 ## 4. Analysis so far (Sat ~00:50): where our time goes on the 30 official samples
 Ours 174.5 s vs perfect 94.4 s: **80 s of waste**. Per patch (waste = ours minus perfect):
@@ -145,6 +150,132 @@ commit, push `exp/early-cutoff`, practice-submit, and afterwards re-check the fi
 **Other measured facts:** packing is provably optimal (0.0 s gap to the lower bound on all labeled commits). Running tests
 ourselves only pays for tiny candidate sets (our CPU is serial, scheduling is parallel). Native CPU here: test_max_nodes 22.4 s
 (no shortcut), test_generator_memory 1.0 s (recorded 6.7 s). In unbiased sets a slow test was never the only failure.
+
+## 8. Practice submissions so far (read from the signed-in track page, Sat Nov 21 ~02:45 ET)
+
+| ID | When | Commit | Run 1 / 2 / 3: simulated, CPU, missed | Score | Note |
+| --- | --- | --- | --- | --- | --- |
+| BB-5E85C0A3 | Fri 10:32 PM | 1a9a77bc3e94 (sub-01, baseline) | 215.778 s, 1.07 / 1.05 / 1.06 s, 0 | 216.8 | **"Entered in the final (your pick)"** |
+| BB-F7D24F70 | Sat 12:01 AM | 1f0c94a64e8f (probe) | 213.771 s, 2.62 / 2.62 / 2.61 s, 0 | 216.4 | best score, not picked |
+| BB-491EBE76 | Sat 2:26 AM | 38923fab3b57 (exp/early-cutoff) | 215.778 s, 0.99 / 0.98 / 0.97 s, 0 | 216.8 | no change at all |
+
+- BB-491EBE76: simulated identical to the baseline to the millisecond and CPU not higher, so **no early-cutoff check ran on any of
+  the 40 practice commits** (a check costs 0.1-5 s). The same commit, fresh-cloned and rebuilt here, has the feature on, the
+  baseline and stage map loading, and runs 3 checks on the 30 samples (`work/exp_fronthalf/image_probe.py`). Conclusion: no practice
+  commit selects test_execute_tpcds through a front-half function-body change. The probe found almost nothing there either.
+- The practice gap is therefore NOT the slow executor test. Strong candidate, measured here: any class-level edit in the base
+  `Dialect`, `Generator`, `Parser` or `Tokenizer` class selects 1347-1585 tests = **27.6-36.8 s** per commit (about 209 True/False
+  flags in those four classes alone). Not yet confirmed on practice.
+- Public board at the same time (195 teams): we are rank 83 (216.4). Top: 138.1, 146.3, 151.4, 152.2, 153.7, 156.3, 158.1;
+  rank 10 = 166.9; about 30 teams between 172 and 186; rank 41 = 185.6.
+- Server CPU is roughly 1.3-1.6x this PC's Docker (baseline 1.06 s for 40 commits there, 0.63 s for 30 here).
+- Clock: this PC is on Eastern time; one submission per hour (next slot about Sat 3:26 AM); cutoff Sun 11:00 AM EST.
+
+## 9. Diagnostic submission and class-attribute selection (Sat Nov 21, ~03:10 ET)
+
+**Diagnostic build, pushed, to be submitted in the 3:26 AM slot:** branch `diag/telemetry-1`, commit
+`89112d3e66cf0855d956da05dff65f94fae69253`. Same selections as 38923fa; it reports how our own selector classified the practice
+commits through the two numbers we get back (comment block above `class Diagnostic` in its selector.py). No misses possible (it
+only ADDS tests to one empty commit), scores ~240-300 s on purpose, never a final candidate.
+Decode with `python work\exp_fronthalf\decode_diag.py <simulated> <cpu>` -> cost of run-everything commits, of class-level
+commits, of function-body commits, whether the early cutoff is usable on the server and whether it would have run.
+(The first push of that branch pointed at 38923fa because a commit command failed on PowerShell quoting; use `git commit -F file`.)
+
+**Executor-side extension of the early cutoff (BR_EC_BACK / BR_EC_PLAN_DIFFS, still off by default):** real-test audit in Linux,
+80 fresh mutants: 42 dropped, **42 of 42 pass the real test**; of 15 kept, 1 would have passed.
+
+**Class-attribute selection (branch `exp/class-attrs`, uncommitted): the likely practice gap.**
+Measured: a class-level edit in the base `Dialect`/`Generator`/`Parser`/`Tokenizer` costs 27.6-36.8 s with the old rule
+("every test that used the class"). 17,962 of sqlglot's lines are class-level (16%), 3,009 of them in those four files.
+- `tools/build_map/attrrec.py`: pytest plugin; wraps every plain class attribute in a descriptor and records which test reads
+  which (class, attribute). Transparent: all 1620 tests pass with it. Recorded twice in br-mapper: whole suite warm
+  (`work/attr_out/warm`), and **every test alone in a fresh process** (`tools/build_map/attr_isolated.py`, `work/attr_out/iso`).
+  `tools/build_map/build_attr_map.py` -> `maps/attr.json.gz` (6361 attributes, 187 KB).
+- `classstate.py`: imports everything with the patched source and fingerprints all 10,094 class attributes and module globals;
+  the diff with the pinned commit (baseline built in the image) is the exact set of attributes the patch changes, including ones
+  derived at import (ktz3: `arg_types` and `required_args`). 0 unstable keys over 5 runs, ~1.2-1.9 s CPU.
+- selector: `resolve_class_level()` runs only the tests that read a changed attribute. Falls back to the old rule when the
+  patch also changes other Python code, changes state the map cannot observe, is already cheap (< 7 s), or the readers alone
+  would not beat the old rule; an import error means run everything. Off switch `BR_CLASSATTR=0`.
+- Results so far: samples 157.7 -> 149.2 s (535z: 171 tests -> 3, the failing one included); flag flips 27.6-36.8 s -> 2.0-4.0 s
+  when few tests read the flag; older labeled sets 0 misses (eval_big 1152.7 -> 1015.4). First 6 of 120 freshly labeled
+  class-level mutants (`work/mutants_cls`, labels `work/label_cls.json`, full suite in br-mapper): 145.8 -> 53.8 s, 0 misses.
+- Evaluate: `work\.venv\Scripts\python work\exp_fronthalf\eval_labeled.py work\mutants_cls work\label_cls.json work\eval_cls BR_CLASSATTR=0 -- BR_CLASSATTR=1`
+  (needs `BR_EC_BASE` and `BR_CA_BASE` pointing at baselines made by the same interpreter).
+- To do: finish labeling (about 90 min), require 0 misses on all 120, sandbox CPU numbers on an idle machine, then ask the user
+  before committing/pushing/submitting.
+
+## 10. Diagnostic result (BB-F4BEB122, Sat 3:31 AM) and what it means
+
+Submitted by Claude through the signed-in built-in browser with the user's OK. All 3 runs: **218.877 s simulated, 53.03 s CPU,
+0 missed** (score 271.9; final pick still BB-5E85C0A3; next slot 4:31 AM). Decoded (`decode_diag.py 218.877 53.03`):
+| Bucket of the 40 practice commits | Cost with the current selector |
+| --- | --- |
+| run-everything fallbacks | **0 s** (none) |
+| class-level / import-time edits | **99 s** |
+| function-body edits | about 57-59 s |
+| everything else (fixtures, test files, docs) | about 58-60 s |
+- The early cutoff IS usable on the server (flag set) and would have run no check: no practice commit qualified.
+- So the class-attribute work (section 9) targets the largest bucket.
+- "Everything else" is larger than small fixture commits explain. Likely cause, measured on the map: an edit to
+  `tests/fixtures/optimizer/tpc-ds/tpc-ds.sql` or `tpc-h/tpc-h.sql` selects all 60 TestExecutor tests = **25.5 s**, because
+  `setUpClass` opens every TPC file and class-setup reads are credited to the whole class. The samples' fixture commits look
+  file-uniform (11 touches, none on those two files); with 29 .sql fixture files, about one such commit per 40 is expected.
+  Idea (not built): for an edit to tpc-ds.sql only, run the early cutoff's front half on the patched fixture; if every
+  fingerprint is identical (most lines are expected output the executor test never reads), drop test_execute_tpcds.
+
+**Class-attribute selection, state at 03:38:** table-entry refinement added (when only the body of a function stored in a
+class-level table changes, run the tests whose coverage includes that lambda's lines). 54 of 120 real-labeled class-level
+mutants so far: 0 misses; at 46 labeled the simulated cost was 1027.2 -> 352.8 s. All features together on the 135 older
+labeled patches: 2326.4 -> 1611.6 s, 0 misses. `classstate.py` check now ~1.1 s CPU (function hashes cached).
+
+## 11. The older class rule can MISS (found Sat ~04:05 ET); the class-attribute rule does not
+
+Hand-picked class-level patches (`work/exp_fronthalf/make_adversarial_cls.py` -> `work/mutants_cls_adv`, labeled with the full
+suite into `work/label_cls_adv.json`). The older rule "every test that used the class or a subclass" (what sub-01 = the current
+final pick BB-5E85C0A3, and 38923fa, do) left failing tests out on 3 of the first 6:
+| Patch | Edit | Failing | Older rule left out |
+| --- | --- | --- | --- |
+| x01 | `MySQL.TIME_MAPPING` entry | 10 | test_hive::test_time, test_presto::test_to_char (other dialects copy the table at import) |
+| x04 | base `Dialect.UNNEST_COLUMN_ONLY = True` | 1117 | test_dialect::test_lazy_load (sqlglot.dialects.duckdb fails to import) |
+| x06 | `MySQL.Tokenizer.IDENTIFIERS` | 43 | 4 tests of redshift / spark / teradata / dialect |
+The class-attribute rule selected every failing test on all 6 (the import-state diff sees the derived attributes in the other
+classes; an import error selects everything). On random class-level mutants the older rule has not missed so far (0 of 82),
+so the hole needs an attribute that other, unrelated classes copy at import: uncommon, but 300 s each.
+Consequence: the class-state check now ALWAYS runs for class-level assignments (no cost gates), and state the map cannot
+observe selects every test. The older rule remains only as the fallback when the check cannot run or the patch also changes
+other Python code.
+Also fixed: for "only the body of a table entry changed", the tests are (ran the entry's lines) AND (read the table); the
+line map alone also credited a test that merely imported the file while it was recorded (6ze8 picked up test_generator_memory).
+
+## 12. Status at 04:35 ET: candidate for the 4:31 slot, and what comes next
+
+**User's standing instruction (Sat ~03:40):** "Yes, if it's clean": commit, push and submit the class-level fix once all 120
+labeled class-level mutants show 0 misses. Submitting goes through the signed-in built-in browser (form fields `repo`, `commit`).
+- 98 of 120 labeled: old rule 2028.3 s -> candidate 740.4 s, **0 misses**; no fallback was needed on any of them.
+- Tricky set: 11 of 12 labeled, candidate 0 misses (older rule misses 3). x12 still to label.
+- Sandbox (image `br-ca`, deadline lifted): samples 148.453, eval_big 1042.358, eval_proxy 298.289, eval_rare 403.028,
+  tricky 193.392: all 0 misses, valid output. With the default 140 s deadline on an oversized 70-commit class-only set the run
+  finished in 139 s wall, 13 checks skipped (older rule), still 0 misses.
+- **Lesson:** Docker's VM has 16 GB. Three labelers plus sandbox runs exhausted it at ~04:22 and the engine hung; I stopped
+  the jobs, ran `wsl --shutdown`, restarted Docker Desktop, and resumed with ONE labeler (`--jobs 6 --parallel 2`). Never run
+  more than about 12 pytest workers in Docker at once. Labels are backed up in `work/label_cls.before_restart.json`.
+
+**Final validation of the candidate (04:52, idle machine):** all 120 class-level mutants labeled by the full suite:
+older rule 2541.7 s -> candidate 938.1 s simulated, **0 misses** (per patch: core files 34.2 -> 12.8 s, other files 9.4 -> 3.3 s).
+Sandbox with the image built from the exact committed tree: 120-set 938.139 s + 119.3 s CPU (about 1.0 s per class check),
+0 misses; samples 148.453 + 9.8 s CPU = 158.3 s (class feature off: 157.741 + 5.6 = 163.3; sub-01: 175.1), 0 misses;
+clean `--no-cache` build 44 s. Tricky set 11 of 12: 0 misses.
+
+**Next features, prototyped in scratch copies only (NOT in the candidate):**
+- `work/exp_fronthalf/patch_fixture.py <dir>`: edits to `tests/fixtures/optimizer/tpc-ds/tpc-ds.sql` (25.5 s today): re-run the
+  early cutoff's front half on the patched fixture; 5 of 12 junk-token mutants keep every fingerprint and drop the 21.5 s
+  test (25.5 -> 10.2 s). Needs labels for `work/mutants_fx` (18 patches) before use.
+- `work/exp_fronthalf/patch_module.py <dir>`: MODULE-LEVEL assignments (constants, the tables in `sqlglot/typing/*.py`,
+  `executor/env.py`). Today they cost 25.8 s on average over 30 random mutants (`work/mutants_mod`), many of them run-everything;
+  the prototype brings that set from 774.2 s to 461.4 s. They are part of the diagnostic's 99 s bucket together with
+  class-level edits and def headers. Needs the 30 labels (`work/label_mod.json`, 2 done, labeling was paused) before use.
+  Both patch scripts apply on top of the candidate's files; apply them in a copy, test, then port.
 
 # >>> END OF HANDOFF. Full history below. <<<
 

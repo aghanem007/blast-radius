@@ -387,6 +387,13 @@ class Selector:
         # Per patch: every function-body statement it changes, as
         # (path, statement's first line, outermost enclosing function's first and last line).
         self.runtime_spots: list[tuple[str, int, int, int]] = []
+        # Class-level changes (see resolve_class_level): the attribute map, and per patch
+        # the plain class attributes it assigns as (class, names, what the older rule
+        # would select, who ran the lambda the edit sits in).
+        self.attrs: "AttrMap | None" = None
+        self.class_spots: list[tuple[str, set[str], set[int] | None, set[int] | None]] = []
+        self.place_calls = 0
+        self._class_base: dict | None | bool = False
 
     def source(self, path: str) -> str | None:
         if path not in self.src_cache:
@@ -398,6 +405,8 @@ class Selector:
         self.prerun_ok = True
         self.new_sources = {}
         self.runtime_spots = []
+        self.class_spots = []
+        self.place_calls = 0
         files = parse_patch(patch_text)
         if not files:
             log("  no files in patch -> all")
@@ -410,7 +419,86 @@ class Selector:
                 self.prerun_ok = False
                 return ALL
             chosen |= got
+        if self.class_spots:
+            got = self.resolve_class_level()
+            if got is ALL:
+                return ALL
+            chosen |= got
         return chosen
+
+    def class_baseline(self) -> dict | None:
+        if self._class_base is False:
+            import classstate
+
+            self._class_base = classstate.load_baseline(str(CA_BASE_PATH))
+        return self._class_base
+
+    def resolve_class_level(self) -> set[int] | None:
+        """The tests for this patch's class-level assignments.
+
+        A class-body statement only acts through the state it leaves after import. So:
+        import the patched code in a child, list the class attributes whose value differs
+        from the pinned commit's (classstate.py: the edited attribute plus anything
+        derived from it at import, in ANY class), and run the tests that read one of them
+        (the attribute map).
+
+        The older rule (every test that used the class or a subclass) is both more
+        expensive and less safe: it misses the tests of a class that merely copies the
+        edited attribute while it is imported (Presto building its table from MySQL's).
+        So the check always runs when it can. The older rule is only the fallback when
+        the check cannot run or finish, or when the patch also changes other Python code.
+        An import error, or a change to state the map cannot observe, selects every test."""
+        olds = [old for _, _, old, _ in self.class_spots]
+        old_union: set[int] | None = ALL if any(o is ALL for o in olds) else set().union(*olds)
+        edited = {f"{qual}:{name}" for qual, names, _, _ in self.class_spots for name in names}
+
+        def keep(why: str):
+            log(f"  class attributes {sorted(edited)[:3]}: {why} -> older rule")
+            return old_union
+
+        if not CLASSATTR or self.attrs is None:
+            return old_union
+        if self.place_calls != len(self.class_spots):
+            return keep("the patch also changes other Python code")
+        base = self.class_baseline()
+        if base is None:
+            return keep("no class-state baseline")
+        import classstate
+
+        cost = max(0.5, float(base.get("cpu_s", 2.0)))
+        remaining = EC_DEADLINE_S - (_wall() - _STARTED)
+        wall = min(5 + 5 * cost, remaining)
+        if wall < 3 + 2 * cost:
+            return keep("out of time budget")
+        verdict = classstate.run_check(str(SRC.resolve()), str(CA_BASE_PATH), dict(self.new_sources), wall, 1 + 3 * cost, log)
+        if verdict is None:
+            return keep("the import-state check gave no verdict")
+        if not verdict.get("ok"):
+            if "import error" in str(verdict.get("why", "")):
+                log(f"  class attributes {sorted(edited)[:3]}: sqlglot no longer imports ({verdict['why'][:120]}) -> all")
+                return ALL
+            return keep(f"the import-state check failed ({verdict.get('why')})")
+        changed = set(verdict["changed"])
+        was = "all" if old_union is ALL else len(old_union)
+        unseen = sorted(k for k in changed if k not in self.attrs.wrapped)
+        if unseen:
+            log(f"  class attributes {sorted(edited)[:3]}: changes state the attribute map cannot observe ({unseen[:3]}) -> all")
+            return ALL
+        # Every edit inside a lambda of a table: the tests that ran those lambdas' lines.
+        callers: set[int] | None = None
+        if all(c is not None for _, _, _, c in self.class_spots):
+            callers = set().union(*(c for _, _, _, c in self.class_spots)) | self.attrs.always
+        tests = self.attrs.readers(changed | edited) | self.attrs.always
+        if verdict.get("code_only") and callers is not None:
+            # Only the body of a function stored in a table changed (same keys, same
+            # defaults and closure). To see that, a test must both read a table that
+            # holds the function and run the function's lines. (The line map alone
+            # also credits a test that merely imported the file while it was recorded.)
+            called = callers & tests
+            log(f"  class attributes {sorted(changed)[:3]}: only the body of a table entry changed -> {len(called)} tests read the table and ran the entry (readers {len(tests)}, older rule: {was}); check cpu {verdict.get('cpu_s')}s")
+            return called
+        log(f"  class attributes changed: {sorted(changed)[:4]}{' ...' if len(changed) > 4 else ''} -> {len(tests)} tests read them (older rule: {was}); check cpu {verdict.get('cpu_s')}s")
+        return tests
 
     def select_file(self, fp: FilePatch) -> set[int] | None:
         path = fp.path
@@ -544,6 +632,7 @@ class Selector:
 
     def place(self, path: str, stmts: list[Stmt], lo: int, hi: int) -> set[int] | None:
         """Tests affected by a change at old lines lo..hi of a Python file."""
+        self.place_calls += 1
         s = innermost(stmts, lo, hi)
         if s is None:
             log(f"  {path}:{lo}: module level outside any statement -> all")
@@ -613,31 +702,26 @@ class Selector:
             return ALL
         if cls_path is not None:
             qual = f"{module_name(path)}.{cls_path}"
-            users = m.set_of(m.classes, qual)
-            if users is not None:
-                # A plain class attribute only matters to code that reads it by name.
-                # Narrow to the class's users that ran such code, unless the name is
-                # also read while modules load (a metaclass building tables from it, or
-                # another class copying it), where tests depend on it without reading it.
-                defined = defined_names(s.node)
-                if (
-                    isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
-                    and defined
-                    and not (defined & m.import_names)
-                ):
-                    readers = self.names_users(defined)
-                    if readers is not None:
-                        got = users & readers
-                        log(f"  {path}:{lo}: attribute {sorted(defined)} of {qual} -> {len(got)} tests (of {len(users)} users)")
-                        return got
-                log(f"  {path}:{lo}: class-level in {qual} -> {len(users)} tests using it")
-                return users
-            got = self.names_users(defined_names(s.node))
-            if got is not None:
-                log(f"  {path}:{lo}: class-level in unused {qual}; names -> {len(got)} tests")
-                return got
-            log(f"  {path}:{lo}: class-level in unused {qual}, unknown names -> all")
-            return ALL
+            old = self.class_level_older_rule(path, lo, s, qual)
+            defined = defined_names(s.node)
+            if (
+                self.attrs is not None
+                and isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                and defined
+                and all(f"{qual}:{name}" in self.attrs.wrapped for name in defined)
+            ):
+                # A plain class attribute the recorder could observe: decided once for
+                # the whole patch, in resolve_class_level().
+                # If the edit sits inside a lambda of the table, also note who called it.
+                lam = None
+                for node in ast.walk(s.node):
+                    if isinstance(node, ast.Lambda) and node.lineno <= lo and hi <= (node.end_lineno or node.lineno):
+                        if lam is None or (node.end_lineno - node.lineno) <= (lam.end_lineno - lam.lineno):
+                            lam = node
+                callers = None if lam is None else m.line_tests(path, lam.lineno, lam.end_lineno or lam.lineno)
+                self.class_spots.append((qual, defined, old, callers))
+                return set()
+            return old
 
         if isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign)):
             got = self.names_users(defined_names(s.node))
@@ -645,6 +729,35 @@ class Selector:
                 log(f"  {path}:{lo}: module constant {sorted(defined_names(s.node))} -> {len(got)} tests")
                 return got
         log(f"  {path}:{lo}: module-level {type(s.node).__name__} -> all")
+        return ALL
+
+    def class_level_older_rule(self, path: str, lo: int, s: Stmt, qual: str) -> set[int] | None:
+        """A class-level statement, by who uses the class (the rule before the attribute map)."""
+        m = self.m
+        users = m.set_of(m.classes, qual)
+        if users is not None:
+            # A plain class attribute only matters to code that reads it by name.
+            # Narrow to the class's users that ran such code, unless the name is
+            # also read while modules load (a metaclass building tables from it, or
+            # another class copying it), where tests depend on it without reading it.
+            defined = defined_names(s.node)
+            if (
+                isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                and defined
+                and not (defined & m.import_names)
+            ):
+                readers = self.names_users(defined)
+                if readers is not None:
+                    got = users & readers
+                    log(f"  {path}:{lo}: attribute {sorted(defined)} of {qual} -> {len(got)} tests (of {len(users)} users)")
+                    return got
+            log(f"  {path}:{lo}: class-level in {qual} -> {len(users)} tests using it")
+            return users
+        got = self.names_users(defined_names(s.node))
+        if got is not None:
+            log(f"  {path}:{lo}: class-level in unused {qual}; names -> {len(got)} tests")
+            return got
+        log(f"  {path}:{lo}: class-level in unused {qual}, unknown names -> all")
         return ALL
 
     def names_users(self, names: set[str]) -> set[int] | None:
@@ -908,6 +1021,42 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
     return sorted(set(keep) | set(failed_numbers))
 
 
+# ------------------------------------------------------------- class attributes
+
+# A statement in a class body (a setting, a table) used to select every test that used
+# the class: 27-37 s for the core Dialect/Generator/Parser/Tokenizer classes. With
+# maps/attr.json.gz (which tests READ which class attribute, recorded per test in
+# isolation by tools/build_map/attrrec.py) and classstate.py (which attributes a patch
+# changes once everything is imported), only the tests that read a changed attribute run.
+CLASSATTR = os.environ.get("BR_CLASSATTR", "1") == "1"
+CA_MAP_PATH = Path(os.environ.get("BR_CA_MAP", APP / "maps" / "attr.json.gz"))
+CA_BASE_PATH = Path(os.environ.get("BR_CA_BASE", APP / "maps" / "class_state.json"))
+
+
+class AttrMap:
+    def __init__(self, path: Path, m: Map) -> None:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            raw = json.load(f)
+        if raw.get("version") != 1:
+            raise ValueError("attribute map version")
+        index = {nodeid: i for i, nodeid in enumerate(m.tests)}
+        if set(raw["tests"]) != set(index):
+            raise ValueError("the attribute map and the coverage map list different tests")
+        self.to_index = [index[t] for t in raw["tests"]]
+        self.wrapped: set[str] = set(raw["wrapped"])
+        self._readers: dict[str, int] = raw["readers"]
+        self._sets: list[list[int]] = raw["sets"]
+        self.always: set[int] = {self.to_index[i] for i in raw["always"]}
+
+    def readers(self, keys) -> set[int]:
+        out: set[int] = set()
+        for key in keys:
+            s = self._readers.get(key)
+            if s is not None:
+                out.update(self.to_index[i] for i in self._sets[s])
+        return out
+
+
 # ------------------------------------------------------------------ early cutoff
 
 # test_execute_tpcds (21.5 s) is scheduled for any change to a line it ran. It has a
@@ -1097,6 +1246,12 @@ def main() -> None:
         COSTS = PrerunCosts(COSTS_PATH)
         runner = prerun.Runner(str(SRC), log=log)
     nodeid_of = {t["number"]: t["id"] for t in tests}
+    if selector is not None and CLASSATTR and CA_MAP_PATH.is_file() and SRC.is_dir() and not unmapped:
+        try:
+            selector.attrs = AttrMap(CA_MAP_PATH, m)
+        except Exception as e:  # never a miss: without it the older class rule applies
+            log(f"attribute map unavailable ({e!r})")
+            selector.attrs = None
     early = None
     if EARLYCUT and selector is not None and SRC.is_dir() and EC_STAGE_PATH.is_file():
         try:
