@@ -1165,10 +1165,12 @@ class AttrMap:
 # test would compare is identical to the pinned commit's, the test cannot change
 # outcome and is dropped. Any difference, error or timeout keeps it.
 EARLYCUT = os.environ.get("BR_EARLYCUT", "1") == "1"
-# The two extensions that execute queries are OFF by default until their real-test
-# audit (work/exp_fronthalf/audit2.py) is complete; with both off this is the audited
-# front-half-only check.
-EC_BACK = os.environ.get("BR_EC_BACK", "0") == "1"  # re-execute queries for back-half patches
+# Re-executing queries for a patch to code the back half runs. Audited against the real
+# test (work/exp_fronthalf/audit_back.py: 42 of 42 dropped tests pass) and on 135
+# labeled patches in the sandbox (0 misses; a full re-execution costs ~15 s CPU against
+# 21.5 s + a worker to schedule the test, and a difference usually shows up early).
+EC_BACK = os.environ.get("BR_EC_BACK", "1") == "1"
+# Executing the queries whose PLAN a front-half patch changed is still off: not audited.
 EC_PLAN_DIFFS = int(os.environ.get("BR_EC_PLAN_DIFFS", "0"))  # execute up to this many queries whose plan changed
 EC_PLAN_DIFF_CPU_S = float(os.environ.get("BR_EC_PLAN_DIFF_CPU", "3"))  # ...within this much baseline CPU
 # An edit to the TPC-DS fixture file itself: re-run the front half on the patched fixture.

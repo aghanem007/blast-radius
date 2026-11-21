@@ -85,6 +85,9 @@ def install_overrides(src: str, overrides: dict[str, str]) -> None:
 # ------------------------------------------------------------------ fingerprint
 
 
+_PLAIN_TYPES = frozenset((bool, int, float, complex, str, bytes))  # written as "name:repr;"
+
+
 class Fingerprinter:
     """A deterministic text dump of an object graph, hashed.
 
@@ -145,16 +148,31 @@ class Fingerprinter:
         seen.add(oid)
         self.visits[t] = self.visits.get(t, 0) + 1
         path.add(oid)
+        # In the loops below a plain constant is written in place (the same text the
+        # call would write): most elements are constants and a call each adds up.
+        plain, dump = _PLAIN_TYPES, self.dump
         if isinstance(obj, (list, tuple)):
             out.append(f"{t.__name__}[")
             for x in obj:
-                self.dump(x, path, out)
+                tx = type(x)
+                if x is None or tx in plain:
+                    out.append(f"{tx.__name__}:{x!r};")
+                else:
+                    dump(x, path, out)
             out.append("]")
         elif isinstance(obj, dict):
             out.append(f"{t.__name__}{{")
             for k, v in obj.items():
-                self.dump(k, path, out)
-                self.dump(v, path, out)
+                tk = type(k)
+                if k is None or tk in plain:
+                    out.append(f"{tk.__name__}:{k!r};")
+                else:
+                    dump(k, path, out)
+                tv = type(v)
+                if v is None or tv in plain:
+                    out.append(f"{tv.__name__}:{v!r};")
+                else:
+                    dump(v, path, out)
             out.append("}")
         elif isinstance(obj, (set, frozenset)):
             texts = []
@@ -186,11 +204,14 @@ class Fingerprinter:
                 except AttributeError:
                     continue
                 out.append(n + "=")
-                if n in self.SHALLOW and isinstance(v, (set, frozenset, list, tuple)):
+                tv = type(v)
+                if v is None or tv in plain:
+                    out.append(f"{tv.__name__}:{v!r};")
+                elif n in self.SHALLOW and isinstance(v, (set, frozenset, list, tuple)):
                     labels = sorted(f"{type(x).__qualname__}:{getattr(x, 'name', None)!r}" for x in v)
                     out.append(f"{type(v).__name__}{labels!r};")
                 else:
-                    self.dump(v, path, out)
+                    dump(v, path, out)
             out.append(">")
         path.discard(oid)
 

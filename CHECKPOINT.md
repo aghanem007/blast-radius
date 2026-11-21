@@ -331,6 +331,78 @@ class 120: 938.139; tricky 12: 245.049; eval_big 906.62 (was 1015.0 on 5b51ebc);
 **It is staged, not committed.** Waiting for the user's go-ahead to commit, push and submit (slot open since 5:53 AM).
 Suggested commit message: "Module-level assignments, function headers and the TPC-DS fixture through the import-state check".
 
+## 15. `exp/module-level` SUBMITTED (BB-1E9B075A, Sat 11:43 AM): 214.9 s, worse than the best; what the data says next
+
+User said "Yes, submit it". Commit `50833960f2e7c48edc64195b175a1bc92d56ef3a` (branch `exp/module-level`, pushed; clean
+`--no-cache` build of the commit 27 s; sandbox samples 148.453 + 10.1 CPU, 0 misses). Practice, all 3 runs:
+**194.714 s simulated, 18.68 / 20.95 / 20.16 s CPU, 0 missed -> 214.9 s.**
+- vs BB-EA6DA914 (5b51ebc, 208.5): simulated -8.1 s, CPU +14.5 s -> **6.4 s WORSE**. Every import-state check costs ~0.82 s
+  CPU here (more on the scorer) and now runs for module-level and header commits too; on practice that bought only 8 s.
+- Final pick is still **BB-5E85C0A3** (page: "is not your best score: BB-EA6DA914 scored better"). Next slot 12:43 PM.
+- Still true: 5b51ebc / 1a9a77b can miss on module-level edits (2 of 30 random ones), 5083396 cannot. Practice score alone
+  does not show that.
+
+**Where the samples' 148.5 s go (`work/exp_fronthalf/where_time.py`, `waste.py`; cheapest correct answer = 94.4 s):**
+- Commits where some test fails (18): we cost 94.7 s vs 94.4 s perfect. Nothing to gain there.
+- Commits where NOTHING fails but we select tests (8): 53.8 s, all waste: 66ks 24.8 (test_execute_tpcds, executor-side
+  change), 4d63 9.1 (class attribute read by 273 tests), 2haz 8.7 (85 tests), five small ones 2.0-2.5 each.
+- The whole suite is only **103 s of recorded time**: test_max_nodes 28.8, test_execute_tpcds 21.5, test_generator_memory
+  6.7, test_execute_tpch 3.9, test_optimized_tpch 3.5, test_scope 2.5, test_tpcds 2.2, test_annotate_funcs 2.0; the other
+  ~1610 tests total about 30 s.
+- Leaders (138 on 40 commits = ~104 per 30) are within ~10 s of the perfect answer, so they detect "nothing fails".
+  The kit README says: "Running sqlglot's tests while you decide is allowed, and you pay for the time."
+
+**Measured on labels (`first_fail.py`, `what_if.py`, `slow_alone.py`), tests run cheapest-first, stop at the first failure:**
+- Official samples: in all 18 failing commits the first failing test appears within 0.07 s of recorded test time.
+  All 327 labeled code patches: within 0.34 s for 90%, but up to 19.7 s (huge selections where one late test fails).
+- SOUND version ("run everything selected ourselves; a failure -> schedule as today; all pass -> select nothing"):
+  samples 148.5 -> 94.7 simulated + ~36 s CPU if run blindly; gated (only when the run costs less than scheduling) about
+  -10 s net for the small commits, plus test_execute_tpcds through `BR_EC_BACK=1` (measured in the sandbox, 0 misses:
+  samples 158.5 -> 152.2, eval_big 994.4 -> 973.2, eval_proxy 321.1 -> 305.2, eval_rare 437.6 -> 383.7).
+- RISKY shortcut ("all tests of at most 3 s pass -> drop the slower ones too, without running them"): on 327 labeled code
+  patches it would apply 37 times and miss 0 times (a slow test failed alone 4 times, always with no cheap candidate at
+  all, where the shortcut does not apply). With a 1.5 s limit it misses 2 (only test_annotate_funcs, 1.96 s, fails).
+  Samples: 66ks alone is +23.8 s. 0 of 37 is not proof (95% bound about 8% per use; break-even is about 7%).
+  **This is the user's decision, not made yet.** Never apply it to fixture edits (12 of 18 TPC fixture mutants would miss).
+- A time budget ("run 3 s, then give up and select nothing") misses 12 of 225 failing labeled commits: rejected.
+
+**Existing pieces to reuse:** `prerun.py` (fork + swap the patched function's code, run tests with unittest; 617 audited
+verdicts, 0 errors) and `try_prerun` in selector.py (`BR_PRERUN`, off). Today on the samples it gains only 1.8 s because
+(a) the image has no test packages (`pytz` missing -> whole commit kept; test_executor/test_optimizer need duckdb, numpy,
+pandas; versions in `requirements.lock`), (b) a SKIPPED test counts as passed (must count as unknown before any use),
+(c) the first import of a test module is charged to one commit, so optimizer tests are never tried, (d) it never stops at
+the first failure, (e) class-level/module-level patches cannot be code-swapped (they need the patched import the
+class-state child already does).
+
+## 16. Branch `exp/cheaper-checks` (Sat ~12:35, from 5083396): validated, STAGED, not committed / pushed / submitted
+
+Staged tree `efcd18f2b3c2b8b3f572f30a8471b08550aa1823` (image `br-cc` built from it, clean build 22 s). Three changes:
+1. **Cheaper import-state check** (`classstate.py`, `earlycut.py`): 77% of a check was fingerprinting, over half of that
+   spent walking every rule for plain constants, classes and enum members. Fast paths write the same text directly; functions
+   and bound methods that sit in many tables are written once and replayed (text + the visited-object bookkeeping).
+   Verified byte-identical: all 11,152 digests equal the old code's baseline, and the early-cutoff baseline is unchanged
+   (`work/exp_fronthalf/time_classstate.py`, `cmp_ec_base.py`). Baseline build 0.777 -> 0.61 s CPU; a check ~0.91 -> ~0.79 s
+   all-in (sandbox: class 120-set 125.1 -> 108.4 s CPU, module 28.3 -> 25.1, header 31.3 -> 28.0). What is left is fixed:
+   importing sqlglot 0.21 s, fingerprint ~0.42 s, compiling the patched file, starting Python.
+2. **Fingerprint hole closed** (class-state VERSION 5): a bound method answered `__code__` with its function's, so
+   `{"ABS": Abs.from_arg_list}` and `{"ABS": Acos.from_arg_list}` had the same digest. Bound methods now include what they
+   are bound to. 26 keys change (the `FUNCTIONS` tables of `Parser` and 25 dialect parsers); 0 unstable keys over 4 runs.
+3. **`BR_EC_BACK` on by default**: a patch to code that only the executor half of test_execute_tpcds runs re-executes the
+   affected queries and compares result fingerprints (~15-17 s CPU for all 57 queries against 21.5 s + a worker).
+
+Sandbox, default flags, 345 labeled patches, **0 misses, valid output**: samples 126.999 + ~26-28 CPU (was 148.453 + 10.1);
+eval_big 862.164 + 117.6; eval_proxy 255.381 + 54.8; eval_rare 317.212 + 71.9; module 461.44 + 25.1; header 438.024 + 28.0;
+fixture 381.477 + 24.9; tricky 245.049 + 11.3; class 938.139 + 108.4. With `BR_EC_BACK=0` it prints exactly what 5083396
+prints (samples 148.453, module 461.44, header 438.024). CPU readings drift ~10% with machine temperature: compare images
+back to back (the same old image read 25.2 s at 12:00 and 28.0 s at 12:35).
+Expected on practice: about 2-3 s less CPU from the checks, plus whatever the executor check finds there (unknown).
+
+**Not built (needs the user's decision before any use): "trust the cheap tests"** = run every cheap candidate ourselves
+(prerun.py, fork + code swap) and, when all pass, also drop the 5 giant tests without running them. Simulated with measured
+run costs (`sim_try.py`): samples about -18 s per 30 commits, 0 misses on 327 labeled code patches; the careful version
+(drop only what we ran) is worth about -3 s. To build: test packages in the image (pytz, tzdata, duckdb, numpy, pandas from
+`requirements.lock`), skipped tests = unknown, stop at the first failure, amortise test-module imports, audit against labels.
+
 # >>> END OF HANDOFF. Full history below. <<<
 
 

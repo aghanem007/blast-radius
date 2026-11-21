@@ -35,7 +35,29 @@ IGNORED_NAMES = frozenset(("_abc_impl",))
 SKIP_GLOBAL_TYPES_FROM = frozenset(("typing", "typing_extensions", "logging", "_thread", "threading", "abc"))
 SKIP_GLOBAL_TYPES = (types.GenericAlias, types.UnionType)
 
-VERSION = 4
+VERSION = 5
+
+# Exactly the types the base fingerprinter writes as "name:repr;".
+_PLAIN = frozenset((bool, int, float, complex, str, bytes))
+_KIND: dict[type, int] = {}  # per type of object: 0 = apply the rules, 1 = a class, 2 = an enum member
+
+
+def _kind_of(t: type, enum_base: type) -> int:
+    """Which fast path, if any, gives the same text as the full rules for objects of type t.
+
+    A class (an instance of `type` or of a metaclass) is written as "<type ...>" unless a
+    rule catches it first; no rule does unless the metaclass defines `__code__`. An enum
+    member is written as "<enum ...>" unless an earlier rule or the base's own order
+    catches it: it must not also be a tuple, list, dict, function-like object, method,
+    partial, property or module."""
+    if hasattr(t, "__code__"):
+        return 0
+    if issubclass(t, type):
+        return 0 if issubclass(t, enum_base) else 1
+    if issubclass(t, enum_base):
+        blocked = (tuple, list, dict, classmethod, staticmethod, property, types.ModuleType, functools.partial, types.MethodType)
+        return 0 if issubclass(t, blocked) else 2
+    return 0
 
 
 class StateFingerprinter(earlycut.Fingerprinter):
@@ -64,6 +86,102 @@ class StateFingerprinter(earlycut.Fingerprinter):
         ).hexdigest()
 
     def dump(self, obj, path, out) -> None:
+        # Fast paths. More than half of all values reached are plain constants, classes
+        # and enum members; none of the rules below applies to them, so write what the
+        # base class would write without walking through every rule first. The text is
+        # byte for byte the same (work/exp_fronthalf/check_fast_fp.py compares both).
+        t = type(obj)
+        if obj is None or t in _PLAIN:
+            out.append(f"{t.__name__}:{obj!r};")
+            return
+        kind = _KIND.get(t)
+        if kind is None:
+            kind = _KIND[t] = _kind_of(t, self.enum)
+        if kind == 1:
+            out.append(f"<type {obj.__module__}.{obj.__qualname__}>")
+            return
+        if kind == 2:
+            out.append(f"<enum {t.__module__}.{t.__qualname__}.{obj.name}>")
+            return
+        if t is types.FunctionType or t is types.MethodType:
+            # The same function or bound method sits in many tables (subclasses copy their
+            # parent's). When what it writes cannot depend on where it is reached from,
+            # write it once and replay it: the text, and the bookkeeping of which objects
+            # were visited (the "aliasing" part of a digest).
+            memo = self.__dict__.setdefault("_callable_memo", {})
+            hit = memo.get(id(obj))
+            if hit is not None and hit[0] is obj:
+                out.append(hit[1])
+                ids, visits = self.ids, self.visits
+                for ty, seen_ids, count in hit[2]:
+                    seen = ids.get(ty)
+                    if seen is None:
+                        ids[ty] = set(seen_ids)
+                    else:
+                        seen |= seen_ids
+                    visits[ty] = visits.get(ty, 0) + count
+                return
+            if self._free_of_context(obj):
+                outer_ids, outer_visits = self.ids, self.visits
+                self.ids, self.visits = {}, {}
+                sub: list[str] = []
+                try:
+                    self.dump_rules(obj, path, sub)
+                    events = tuple((ty, frozenset(found), self.visits[ty]) for ty, found in self.ids.items())
+                finally:
+                    self.ids, self.visits = outer_ids, outer_visits
+                text = "".join(sub)
+                memo[id(obj)] = (obj, text, events)
+                out.append(text)
+                for ty, seen_ids, count in events:
+                    seen = outer_ids.get(ty)
+                    if seen is None:
+                        outer_ids[ty] = set(seen_ids)
+                    else:
+                        seen |= seen_ids
+                    outer_visits[ty] = outer_visits.get(ty, 0) + count
+                return
+        self.dump_rules(obj, path, out)
+
+    def _free_of_context(self, obj) -> bool:
+        """True when dumping this function or bound method visits nothing that could be
+        an enclosing object of some other place it is reached from: no closure, and
+        default values that are constants, classes or enum members only. (A cycle
+        marker is the one thing a dump writes that depends on the path to it.)"""
+        if type(obj) is types.MethodType:
+            owner = obj.__self__
+            if not (owner is None or type(owner) in _PLAIN or self._plain_kind(owner)):
+                return False
+            obj = obj.__func__
+            if type(obj) is not types.FunctionType:
+                return False
+        if obj.__closure__ is not None:
+            return False
+        defaults = obj.__defaults__
+        if defaults is None:
+            return True
+        if type(defaults) is not tuple:
+            return False
+        return all(x is None or type(x) in _PLAIN or self._plain_kind(x) for x in defaults)
+
+    def _plain_kind(self, obj) -> bool:
+        t = type(obj)
+        kind = _KIND.get(t)
+        if kind is None:
+            kind = _KIND[t] = _kind_of(t, self.enum)
+        return kind != 0
+
+    def dump_rules(self, obj, path, out) -> None:
+        if isinstance(obj, types.MethodType):
+            # Before the `__code__` rule: a bound method answers `__code__`, `__qualname__`
+            # and `__defaults__` with its function's, so without this `Abs.from_arg_list`
+            # and `Acos.from_arg_list` would read the same. What it is bound to is part
+            # of its value.
+            out.append("<bound method ")
+            self.dump(obj.__func__, path, out)
+            self.dump(obj.__self__, path, out)
+            out.append(">")
+            return
         code = getattr(obj, "__code__", None)
         if isinstance(code, types.CodeType):
             out.append(f"<code {self.code_text(code)}>")
@@ -87,12 +205,6 @@ class StateFingerprinter(earlycut.Fingerprinter):
             self.dump(obj.func, path, out)
             self.dump(obj.args, path, out)
             self.dump(obj.keywords, path, out)
-            out.append(">")
-            return
-        elif isinstance(obj, types.MethodType):
-            out.append("<bound method ")
-            self.dump(obj.__func__, path, out)
-            self.dump(obj.__self__, path, out)
             out.append(">")
             return
         elif isinstance(obj, (tuple, list)) and obj and all(isinstance(x, type) for x in obj):

@@ -92,3 +92,4 @@ samples, and `tools/mutate/label.py` labels them by running the real suite in th
 | BB-491EBE76 | `38923fa` | `exp/early-cutoff` | + early cutoff | 215.778 + 0.98 s, 0 | 216.8 |
 | BB-F4BEB122 (diagnostic) | `89112d3` | `diag/telemetry-1` | Same selections; reports how the selector classified the commits. Not a candidate. | 218.877 + 53.03 s, 0 | 271.9 |
 | BB-EA6DA914 | `5b51ebc` | `exp/class-attrs` | + class-attribute selection | 202.814 + 5.65 s, 0 | 208.5 |
+| BB-1E9B075A | `5083396` | `exp/module-level` | + module-level assignments, function headers, TPC-DS fixture | 194.714 + 20.16 s, 0 | 214.9 |
