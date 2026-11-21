@@ -13,8 +13,8 @@ the earliest submission).
 | **Current working version (submit candidate)** | branch `selector/v2` HEAD (see `git log -1 selector/v2`); review fixes shipped Nov 20 ~22:40. Previous: `e031ecbe0e4889a4af95727d4606a4c3fb3c438c`. Map only plus runner (prerun on by default in code; see decisions) |
 | Review work in progress | branch `review/wip`, commit `4c9f9fc57735c645fd9c2de2ad0376f7cca02bca` (current checkout) |
 | Not yet submitted | Nothing has been submitted on the track page |
-| Strategy doc | https://claude.ai/artifact/S9GLzXzdo6H9Zxwvb26wyK |
-| Critical review report | https://claude.ai/artifact/ChJcHJZrdmCMox2gxp7aSj |
+| Strategy doc | private team doc (link shared directly) |
+| Critical review report | private team doc (link shared directly) |
 | sqlglot @ eb11aec source | `work/src/sqlglot` (git-ignored) |
 | Raw recordings | `work/out` (warm map raw), `work/out_cold` (cold), `work/out_union` (union) |
 
