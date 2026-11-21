@@ -98,6 +98,10 @@ kills it if it's still running.
   registry attributes `key`/`_sql_names` -> all (P5).
 - Verified in the scorer sandbox: 0 misses on 121 labeled patches; samples 174.5 s + ~1.4 s CPU; `run_sample.py` format ok.
 
+- Nov 20 ~23:00: test-file top-level code that runs at import -> all (exotic `m11020t`:
+  `__name__ != "__main__"` in tests/test_docs.py crashed the pytest session; we had selected 0).
+  **Submit candidate: selector/v2 @ 439b5e4b47a01e24242d4dd8a1db3aa44bb215b0.** 0 misses on 125 labeled patches.
+
 ## Next steps (in order)
 
 1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
