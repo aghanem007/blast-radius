@@ -65,8 +65,33 @@ def tree_changed(old: str, new: str) -> bool:
         return False  # we want valid Python, like the samples
 
 
+FOCUS_ROWS: dict[str, set[int]] | None = None  # rel path -> lines a big test runs
+
+
+def load_focus(min_seconds: float) -> dict[str, set[int]]:
+    """Lines run by at least one test that takes >= min_seconds (from maps/)."""
+    import gzip
+    import json
+
+    m = json.load(gzip.open(ROOT / "maps" / "map.json.gz", "rt"))
+    tests = json.loads((ROOT / "sample" / "tests.json").read_text())["tests"]
+    secs = {t["id"]: t["seconds"] for t in tests}
+    big = {i for i, nodeid in enumerate(m["tests"]) if secs.get(nodeid, 0) >= min_seconds}
+    big_sets = {k for k, s in enumerate(m["sets"]) if big.intersection(s)}
+    return {
+        f: {ln for ln, s in pairs if s in big_sets}
+        for f, pairs in m["lines"].items()
+        if f.startswith("sqlglot/")
+    }
+
+
 def mutate_code(rng: random.Random, path: Path) -> str | None:
     old = path.read_text(encoding="utf-8")
+    focus = None
+    if FOCUS_ROWS is not None:
+        focus = FOCUS_ROWS.get(path.relative_to(SRC).as_posix())
+        if not focus:
+            return None
     try:
         toks = list(tokenize.generate_tokens(io.StringIO(old).readline))
     except (tokenize.TokenError, SyntaxError):
@@ -89,7 +114,7 @@ def mutate_code(rng: random.Random, path: Path) -> str | None:
     rng.shuffle(candidates)
     for tok, repl in candidates[:40]:
         (row, col), (erow, ecol) = tok.start, tok.end
-        if row != erow:
+        if row != erow or (focus is not None and row not in focus):
             continue
         line = lines[row - 1]
         if tok.string == "is" and line[ecol:].startswith(" not"):
@@ -153,6 +178,12 @@ def main() -> None:
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     kinds = ["code"] * 16 + ["fixture"] * 8 + ["comment"] * 3 + ["multi"] * 3
+    if "--focus-big" in sys.argv:
+        # Only code mutants, on lines a slow test (>= 2 s) runs: the data we need to
+        # decide when skipping a slow test is safe.
+        global FOCUS_ROWS
+        FOCUS_ROWS = load_focus(2.0)
+        kinds = ["code"]
     made = 0
     while made < count:
         kind = rng.choice(kinds)

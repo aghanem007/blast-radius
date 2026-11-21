@@ -1,4 +1,5 @@
-# Keep the build context small: the scorer image only needs selector.py and maps/.
+# Keep the build context small: the scorer image only needs selector.py, prerun.py,
+# requirements.lock and maps/.
 work/
 sample/
 tools/

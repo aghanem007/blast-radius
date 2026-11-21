@@ -17,12 +17,33 @@ py run_sample.py --check  # output format only
 
 (`make sample` does the same on machines that have make.)
 
+## How the selector works
+
+1. **Map (offline, `tools/build_map/`).** Runs sqlglot's whole suite at the pinned commit in the
+   scorer's image, recording per test: lines run (coverage contexts), files opened, sqlglot
+   classes used. Process pools run in-process with pickling, so work done in pool workers is
+   attributed to the right test. Output: `maps/map.json.gz` (~0.8 MB).
+2. **Select (`selector.py`).** For each patch: comment-only edits (same compiled code) select
+   nothing; function-body edits select the tests that ran that statement; class-level edits select
+   the tests that used the class or a subclass; fixtures select the tests that opened them;
+   anything that runs at import, or that we can't place, selects every test.
+3. **Try (`prerun.py`).** For function-body edits, fork a warm copy of the process, swap the new
+   code into the live functions, and run the cheap candidate tests ourselves. Only the ones that
+   fail get scheduled. Used only when the measured CPU (`maps/prerun_costs.json`, from
+   `tools/calibrate_prerun.py`) is lower than the time it saves.
+4. **Pack.** Longest test first onto the least-loaded worker, trying 1 to 8 workers.
+
+Checking for misses beyond the 30 samples: `tools/mutate/make_mutants.py` makes fake-bug
+patches like the samples, and `tools/mutate/label.py` labels them by running the real suite
+(it reproduces `sample/answers.json` exactly).
+
 ## Layout
 
 | Path | What it is |
 | --- | --- |
 | `Dockerfile` | What the scorer builds. Must stay at the top of the repo. |
 | `selector.py` | The program the scorer runs. Reads `/data`, prints one JSON line per commit. |
+| `prerun.py` | Runs cheap candidate tests against the patched code in a forked child. |
 | `maps/` | Precomputed maps from the pinned commit (coverage, fixtures). Committed, under 20 MB total. |
 | `tools/` | Scripts we run on our own machines to build the maps and evaluate. Not used at score time. |
 | `sample/` | The kit's 30 sample commits, `tests.json` and answers. |

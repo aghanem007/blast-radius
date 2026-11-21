@@ -27,6 +27,7 @@ import json
 import os
 import re
 import sys
+import types
 from pathlib import Path
 
 DATA = Path(os.environ.get("BR_DATA", "/data"))
@@ -223,11 +224,52 @@ def hunk_changes(old_start: int, body: list[str]) -> tuple[list[int], list[int]]
 # ------------------------------------------------------------------- python ast
 
 
+_COMPILED: dict[str, list] = {}
+
+
+def _code_list(src: str) -> list | None:
+    """Every code object of a module, in a fixed order, keyed by its source text."""
+    found = _COMPILED.get(src)
+    if found is None:
+        try:
+            top = compile(src, "<m>", "exec", dont_inherit=True)
+        except (SyntaxError, ValueError):
+            return None
+        found, stack = [], [top]
+        while stack:
+            co = stack.pop()
+            found.append(co)
+            stack.extend(c for c in reversed(co.co_consts) if isinstance(c, types.CodeType))
+        _COMPILED[src] = found
+    return found
+
+
+def _behavior(co):
+    """What a code object does, ignoring line numbers (comments move lines around).
+
+    Python 3.13 stores a class's first line as a constant in its body
+    (__firstlineno__, used only by introspection), so that constant is ignored too."""
+    class_line = co.co_firstlineno if "__firstlineno__" in co.co_names else None
+    consts = tuple(
+        "<code>" if isinstance(c, types.CodeType)
+        else "<firstlineno>" if type(c) is int and c == class_line
+        else (type(c).__name__, c)
+        for c in co.co_consts
+    )
+    return (
+        co.co_name, co.co_qualname, co.co_code, co.co_names, co.co_varnames, co.co_freevars,
+        co.co_cellvars, consts, co.co_flags, co.co_argcount, co.co_kwonlyargcount, co.co_posonlyargcount,
+    )
+
+
 def same_tree(a: str, b: str) -> bool:
-    try:
-        return ast.dump(ast.parse(a)) == ast.dump(ast.parse(b))
-    except SyntaxError:
+    """True when two sources compile to the same code (comments, spacing, redundant
+    parentheses: Trivial Compiler Equivalence). Docstrings are constants, so a
+    docstring edit is a real change here."""
+    x, y = _code_list(a), _code_list(b)
+    if x is None or y is None or len(x) != len(y):
         return False
+    return all(_behavior(p) == _behavior(q) for p, q in zip(x, y))
 
 
 class Stmt:
@@ -314,6 +356,11 @@ class Selector:
     def __init__(self, m: Map) -> None:
         self.m = m
         self.src_cache: dict[str, str | None] = {}
+        self.stmt_cache: dict[str, list[Stmt]] = {}
+        # Per patch: can its candidate tests be tried with prerun.py? Only when every
+        # real change is inside sqlglot function bodies (see prerun.py).
+        self.prerun_ok = False
+        self.new_sources: dict[str, str] = {}
 
     def source(self, path: str) -> str | None:
         if path not in self.src_cache:
@@ -322,20 +369,26 @@ class Selector:
         return self.src_cache[path]
 
     def select(self, patch_text: str) -> set[int] | None:
+        self.prerun_ok = True
+        self.new_sources = {}
         files = parse_patch(patch_text)
         if not files:
             log("  no files in patch -> all")
+            self.prerun_ok = False
             return ALL
         chosen: set[int] = set()
         for fp in files:
             got = self.select_file(fp)
             if got is ALL:
+                self.prerun_ok = False
                 return ALL
             chosen |= got
         return chosen
 
     def select_file(self, fp: FilePatch) -> set[int] | None:
         path = fp.path
+        if not (path.startswith("sqlglot/") and path.endswith(".py")):
+            self.prerun_ok = False  # fixtures, tests, data: their own rules
         if fp.binary:
             return self.data_file(path, fp)
         if path in PYTEST_CONFIG or path.endswith("/conftest.py"):
@@ -385,17 +438,15 @@ class Selector:
             log(f"  {path}: patch does not apply ({e}) -> all")
             return ALL
         new = "\n".join(new_lines)
-        try:
-            ast.parse(new)
-        except SyntaxError:
+        if _code_list(new) is None:  # does not compile
             log(f"  {path}: syntax error after patch -> {'its tests' if self.is_test_module(path) else 'all'}")
             return self.whole_test_file(path) if self.is_test_module(path) else ALL
         if same_tree(old, new):
-            log(f"  {path}: same syntax tree (comments/formatting) -> none")
+            log(f"  {path}: same compiled code (comments/formatting) -> none")
             return set()
+        self.new_sources[path] = new
 
-        tree = ast.parse(old)
-        stmts = index_statements(tree)
+        stmts = self.statements(path, old)
         out: set[int] = set()
         for old_start, body in fp.hunks:
             # skip hunks that on their own leave the syntax tree unchanged
@@ -414,6 +465,13 @@ class Selector:
                 out |= got
         return out
 
+    def statements(self, path: str, old: str) -> list[Stmt]:
+        """The original file's statements, parsed once per run."""
+        found = self.stmt_cache.get(path)
+        if found is None:
+            found = self.stmt_cache[path] = index_statements(ast.parse(old))
+        return found
+
     def is_test_module(self, path: str) -> bool:
         return path.startswith("tests/") and path.rsplit("/", 1)[-1].startswith("test_")
 
@@ -429,6 +487,7 @@ class Selector:
         m = self.m
 
         if is_docstring(s):
+            self.prerun_ok = False  # doctests read __doc__, which a code swap leaves alone
             docs = self.whole_test_file("tests/test_docs.py")
             log(f"  {path}:{lo}: docstring -> {len(docs)} doc tests")
             return docs
@@ -441,6 +500,9 @@ class Selector:
             got = m.line_tests(path, s.start, s.end)
             log(f"  {path}:{lo}: runtime statement {s.start}-{s.end} -> {len(got)} tests")
             return got
+
+        # Everything below runs at import time: not something a code swap can try.
+        self.prerun_ok = False
 
         # A def or class header itself (signature, defaults, decorators, bases).
         if isinstance(s.node, (ast.FunctionDef, ast.AsyncFunctionDef)) and lo <= (s.node.body[0].lineno - 1):
@@ -522,6 +584,158 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
     return best_workers
 
 
+# ------------------------------------------------------------------------ prerun
+
+PRERUN = os.environ.get("BR_PRERUN", "1") != "0"
+ELIDE_BIG = os.environ.get("BR_ELIDE", "0") == "1"  # giant-test skip: off until the data supports it
+AUDIT = os.environ.get("BR_AUDIT", "0") == "1"  # validation: log the runner's verdict on every cheap candidate
+CHEAP_MS = 1500  # tests at most this long may be run by us; longer ones are scheduled
+PRERUN_OVERHEAD_MS = 40  # fork and code swap, per patch
+COST_MARGIN = 1.15  # our CPU can vary from the calibration run
+COSTS_PATH = Path(os.environ.get("BR_COSTS", APP / "maps" / "prerun_costs.json"))
+
+
+class PrerunCosts:
+    """Measured CPU of running tests ourselves (tools/calibrate_prerun.py).
+
+    child_ms[nodeid]: a cold forked child running only that test; import_ms[file]:
+    importing the test module in the parent, paid once per run. Tests without a
+    measurement are never run by us.
+    """
+
+    def __init__(self, path: Path) -> None:
+        raw = json.loads(path.read_text())
+        self.child_ms: dict[str, int] = raw["child_ms"]
+        self.import_ms: dict[str, int] = raw["import_ms"]
+        self.imported: set[str] = set()
+        # Each measurement = the module's one-time work in a fresh child (class setup,
+        # lazy sqlglot init) + the test itself. Split them: a module's startup is its
+        # cheapest measurement; a test's own cost is what it adds on top of that.
+        self.startup_ms: dict[str, int] = {}
+        for nodeid, v in self.child_ms.items():
+            if v < 10**6:
+                f = nodeid.split("::", 1)[0]
+                self.startup_ms[f] = min(v, self.startup_ms.get(f, v))
+
+    def test_ms(self, nodeid: str) -> int | None:
+        v = self.child_ms.get(nodeid)
+        if v is None or v >= 10**6:
+            return None
+        return v - self.startup_ms[nodeid.split("::", 1)[0]]
+
+    def run_ms(self, nodeids: list[str]) -> float:
+        files = {n.split("::", 1)[0] for n in nodeids}
+        total = sum(self.test_ms(n) for n in nodeids)
+        total += sum(self.startup_ms[f] for f in files)
+        total += sum(self.import_ms.get(f, 500) for f in files - self.imported)
+        return COST_MARGIN * total + PRERUN_OVERHEAD_MS
+
+
+COSTS: PrerunCosts | None = None
+
+
+def _cpu() -> tuple[float, float]:
+    import resource
+
+    me = resource.getrusage(resource.RUSAGE_SELF)
+    kids = resource.getrusage(resource.RUSAGE_CHILDREN)
+    return me.ru_utime + me.ru_stime, kids.ru_utime + kids.ru_stime
+
+
+def commit_cost_ms(numbers: list[int], ms: dict[int, int]) -> int:
+    workers = best_split([(n, ms[n]) for n in numbers])
+    if not workers:
+        return 0
+    return max(sum(ms[n] for n in w) for w in workers) + WORKER_COST_MS * len(workers)
+
+
+def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) -> list[int]:
+    """Run the cheap candidates against the patched code; keep only those that fail.
+
+    Expensive candidates are always kept (scheduled). Falls back to the full list
+    whenever the change is not a pure function-body change or it would not pay.
+    """
+    import prerun
+
+    swaps = {}
+    for path, new in selector.new_sources.items():
+        planned = prerun.plan_swaps(str(SRC / path), selector.source(path), new)
+        if planned is None:
+            log(f"  prerun: {path} is not a pure function-body change")
+            return numbers
+        swaps[path] = planned
+    if not swaps:
+        return numbers
+
+    if COSTS is None:
+        return numbers
+    cheap = [
+        n for n in numbers
+        if ms[n] <= CHEAP_MS and runner.runnable(nodeid_of[n]) and COSTS.test_ms(nodeid_of[n]) is not None
+    ]
+    if not cheap:
+        return numbers
+
+    if AUDIT:
+        # Validation only: run every cheap candidate and log exactly what the runner
+        # says, to compare test by test with labels from the real suite.
+        by_nodeid = {nodeid_of[n]: n for n in cheap}
+        failed = runner.run(swaps, list(by_nodeid), 30 + 4 * sum(ms[n] for n in cheap) / 1000)
+        log(f"  AUDIT ran={sorted(cheap)} failed={sorted(by_nodeid[x] for x in failed if x in by_nodeid)}")
+        return numbers
+
+    if ELIDE_BIG and len(cheap) < len(numbers):
+        # Giant-test skip (off unless BR_ELIDE=1): run every cheap candidate; if none
+        # fails, the change survived every cheap test that runs it, and we drop the
+        # slow candidates too. Only justified by measured data: in labeled mutants,
+        # a slow test never failed unless a cheap candidate also failed.
+        run_cost = COSTS.run_ms([nodeid_of[n] for n in cheap])
+        if run_cost < commit_cost_ms(numbers, ms):
+            by_nodeid = {nodeid_of[n]: n for n in cheap}
+            failed = runner.run(swaps, list(by_nodeid), 5 + 4 * sum(ms[n] for n in cheap) / 1000)
+            COSTS.imported |= {n.split("::", 1)[0] for n in by_nodeid}
+            failed_numbers = {by_nodeid[x] for x in failed if x in by_nodeid}
+            if not failed_numbers:
+                log(f"  prerun+skip: all {len(cheap)} cheap candidates pass; dropping {len(numbers) - len(cheap)} slow ones")
+                return []
+            slow = [n for n in numbers if n not in set(cheap)]
+            log(f"  prerun+skip: {len(failed_numbers)} cheap fail; keeping them and {len(slow)} slow ones")
+            return sorted(set(slow) | failed_numbers)
+    # Run only the cheap tests whose CPU pays for itself: drop the costliest to run
+    # first, while that keeps the saving above the cost.
+    cheap.sort(key=lambda n: COSTS.test_ms(nodeid_of[n]))
+    best = None
+    cuts = range(len(cheap), 0, -1)
+    if len(cheap) > 12:  # packing is not free: try a dozen cut points, not all of them
+        cuts = sorted({max(1, round(len(cheap) * f)) for f in (1, .9, .8, .7, .6, .5, .4, .3, .2, .1, .05)}, reverse=True)
+    for cut in cuts:
+        run = cheap[:cut]
+        keep = [n for n in numbers if n not in set(run)]
+        run_cost = COSTS.run_ms([nodeid_of[n] for n in run])
+        saving = commit_cost_ms(numbers, ms) - commit_cost_ms(keep, ms)
+        if saving - run_cost > 0 and (best is None or saving - run_cost > best[0]):
+            best = (saving - run_cost, run, keep, run_cost, saving)
+    if best is None:
+        log(f"  prerun: not worth it for {len(cheap)} cheap candidates")
+        return numbers
+    _, cheap, keep, run_cost, saving = best
+    log(f"  prerun: expect cost {run_cost / 1000:.2f}s to save up to {saving / 1000:.2f}s")
+
+    deadline = 5 + 4 * sum(ms[n] for n in cheap) / 1000
+    by_nodeid = {nodeid_of[n]: n for n in cheap}
+    cpu0 = _cpu()
+    failed = runner.run(swaps, list(by_nodeid), deadline)
+    COSTS.imported |= {n.split("::", 1)[0] for n in by_nodeid}
+    cpu1 = _cpu()
+    failed_numbers = [by_nodeid[x] for x in failed if x in by_nodeid]
+    log(
+        f"  prerun: ran {len(cheap)} cheap tests ({sum(ms[n] for n in cheap) / 1000:.2f}s recorded), "
+        f"{len(failed_numbers)} failed; keeping {len(keep)} slow ones; "
+        f"cpu parent {cpu1[0] - cpu0[0]:.2f}s child {cpu1[1] - cpu0[1]:.2f}s"
+    )
+    return sorted(set(keep) | set(failed_numbers))
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -549,6 +763,15 @@ def main() -> None:
             log(f"{len(unmapped)} tests are not in the map; they run on every non-empty selection")
 
     selector = Selector(m) if m is not None else None
+    runner = None
+    if PRERUN and hasattr(os, "fork") and SRC.is_dir() and COSTS_PATH.is_file():
+        import prerun
+
+        global COSTS
+        COSTS = PrerunCosts(COSTS_PATH)
+        runner = prerun.Runner(str(SRC), log=log)
+    nodeid_of = {t["number"]: t["id"] for t in tests}
+
     for patch in sorted((DATA / "commits").glob("*.patch")):
         log(f"{patch.stem}:")
         chosen: set[int] | None = ALL
@@ -564,6 +787,11 @@ def main() -> None:
             numbers = sorted({to_number[i] for i in chosen if i in to_number})
             if numbers and unmapped:
                 numbers = sorted(set(numbers) | set(unmapped))
+            if runner is not None and numbers and selector.prerun_ok and not unmapped:
+                try:
+                    numbers = try_prerun(runner, selector, numbers, ms, nodeid_of)
+                except Exception as e:  # never a miss: keep the full selection
+                    log(f"  prerun error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
         print(json.dumps({"commit": patch.stem, "workers": workers}))

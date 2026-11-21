@@ -84,22 +84,31 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
 
 
 def main() -> None:
+    import threading
+    from concurrent.futures import ThreadPoolExecutor
+
     patch_dir, out_path = Path(sys.argv[1]), Path(sys.argv[2])
     jobs = int(sys.argv[sys.argv.index("--jobs") + 1]) if "--jobs" in sys.argv else 14
+    parallel = int(sys.argv[sys.argv.index("--parallel") + 1]) if "--parallel" in sys.argv else 1
     answers = json.loads(out_path.read_text())["commits"] if out_path.exists() else {}
-    for patch in sorted(patch_dir.glob("*.patch")):
-        if patch.stem in answers:
-            continue
+    todo = [p for p in sorted(patch_dir.glob("*.patch")) if p.stem not in answers]
+    lock = threading.Lock()
+
+    def run(patch: Path) -> None:
         t0 = time.time()
         try:
             got = label_one(patch.stem, patch.read_text(encoding="utf-8"), jobs)
         except Exception as e:
-            print(f"{patch.stem}: ERROR {e}", file=sys.stderr)
-            continue
-        answers[patch.stem] = {"failing": got["failing"], "kind": "generated"}
-        out_path.write_text(json.dumps({"commits": answers}, indent=1))
+            print(f"{patch.stem}: ERROR {e}", file=sys.stderr, flush=True)
+            return
+        with lock:
+            answers[patch.stem] = {"failing": got["failing"], "kind": "generated"}
+            out_path.write_text(json.dumps({"commits": answers}, indent=1))
         extra = f" (unmapped failures: {got['unknown_failed'][:3]})" if got["unknown_failed"] else ""
-        print(f"{patch.stem}: {len(got['failing'])} failing in {time.time() - t0:.0f}s{extra}", file=sys.stderr)
+        print(f"{patch.stem}: {len(got['failing'])} failing in {time.time() - t0:.0f}s{extra}", file=sys.stderr, flush=True)
+
+    with ThreadPoolExecutor(parallel) as pool:
+        list(pool.map(run, todo))
 
 
 if __name__ == "__main__":
