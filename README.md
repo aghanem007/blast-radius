@@ -31,7 +31,14 @@ py run_sample.py --check  # output format only
    code into the live functions, and run the cheap candidate tests ourselves. Only the ones that
    fail get scheduled. Used only when the measured CPU (`maps/prerun_costs.json`, from
    `tools/calibrate_prerun.py`) is lower than the time it saves.
-4. **Pack.** Longest test first onto the least-loaded worker, trying 1 to 8 workers.
+4. **Early cutoff (`earlycut.py`, branch `exp/early-cutoff`).** The slowest commonly selected test,
+   `test_execute_tpcds` (21.5 s), has a cheap front half (parse, optimize and plan the TPC-DS queries)
+   and an expensive back half (execute them). For a patch that only touches front-half code, we re-run
+   the front half on the patched code and compare what it hands to the executor with the pinned
+   commit's fingerprints. Identical means the test cannot change outcome, so it is not scheduled. Any
+   difference, error or timeout keeps it. `maps/tpcds_stage.json.gz` (from
+   `tools/build_map/record_stage.py`) says which code runs in which half.
+5. **Pack.** Longest test first onto the least-loaded worker, trying 1 to 8 workers.
 
 Checking for misses beyond the 30 samples: `tools/mutate/make_mutants.py` makes fake-bug
 patches like the samples, and `tools/mutate/label.py` labels them by running the real suite
@@ -44,6 +51,7 @@ patches like the samples, and `tools/mutate/label.py` labels them by running the
 | `Dockerfile` | What the scorer builds. Must stay at the top of the repo. |
 | `selector.py` | The program the scorer runs. Reads `/data`, prints one JSON line per commit. |
 | `prerun.py` | Runs cheap candidate tests against the patched code in a forked child. |
+| `earlycut.py` | Early cutoff for `test_execute_tpcds`: re-runs its front half on the patched code. |
 | `maps/` | Precomputed maps from the pinned commit (coverage, fixtures). Committed, under 20 MB total. |
 | `tools/` | Scripts we run on our own machines to build the maps and evaluate. Not used at score time. |
 | `sample/` | The kit's 30 sample commits, `tests.json` and answers. |

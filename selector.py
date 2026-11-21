@@ -384,6 +384,9 @@ class Selector:
         # real change is inside sqlglot function bodies (see prerun.py).
         self.prerun_ok = False
         self.new_sources: dict[str, str] = {}
+        # Per patch: every function-body statement it changes, as
+        # (path, statement's first line, outermost enclosing function's first and last line).
+        self.runtime_spots: list[tuple[str, int, int, int]] = []
 
     def source(self, path: str) -> str | None:
         if path not in self.src_cache:
@@ -394,6 +397,7 @@ class Selector:
     def select(self, patch_text: str) -> set[int] | None:
         self.prerun_ok = True
         self.new_sources = {}
+        self.runtime_spots = []
         files = parse_patch(patch_text)
         if not files:
             log("  no files in patch -> all")
@@ -559,6 +563,13 @@ class Selector:
                 return ALL
             got = m.line_tests(path, s.start, s.end)
             log(f"  {path}:{lo}: runtime statement {s.start}-{s.end} -> {len(got)} tests")
+            outer, p = s.func, s.parent
+            while p is not None:
+                if isinstance(p.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+                    outer = p.node
+                p = p.parent
+            first = min([outer.lineno] + [d.lineno for d in outer.decorator_list])
+            self.runtime_spots.append((path, s.start, first, outer.end_lineno or outer.lineno))
             return got
 
         # Everything below runs at import time: not something a code swap can try.
@@ -897,6 +908,146 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
     return sorted(set(keep) | set(failed_numbers))
 
 
+# ------------------------------------------------------------------ early cutoff
+
+# test_execute_tpcds (21.5 s) is scheduled for any change to a line it ran. It has a
+# cheap front half (parse, optimize and plan the TPC-DS queries) and an expensive back
+# half (execute them). earlycut.py re-runs, on the patched code, only what the patch
+# can reach: the front half if the patched function runs there, and the execution of
+# just the queries whose back half reaches the patched function. If everything the
+# test would compare is identical to the pinned commit's, the test cannot change
+# outcome and is dropped. Any difference, error or timeout keeps it.
+EARLYCUT = os.environ.get("BR_EARLYCUT", "1") == "1"
+# The two extensions that execute queries are OFF by default until their real-test
+# audit (work/exp_fronthalf/audit2.py) is complete; with both off this is the audited
+# front-half-only check.
+EC_BACK = os.environ.get("BR_EC_BACK", "0") == "1"  # re-execute queries for back-half patches
+EC_PLAN_DIFFS = int(os.environ.get("BR_EC_PLAN_DIFFS", "0"))  # execute up to this many queries whose plan changed
+EC_PLAN_DIFF_CPU_S = float(os.environ.get("BR_EC_PLAN_DIFF_CPU", "3"))  # ...within this much baseline CPU
+EC_STAGE_PATH = Path(os.environ.get("BR_EC_STAGE", APP / "maps" / "tpcds_stage.json.gz"))
+EC_BASE_PATH = Path(os.environ.get("BR_EC_BASE", APP / "maps" / "tpcds_base.json"))
+# The whole batch has 180 s of wall time (270 s in the final). Every check, including
+# its own timeout, must END before this many seconds after the program started; the
+# selection itself takes about a second for the whole batch.
+EC_DEADLINE_S = float(os.environ.get("BR_EC_DEADLINE", "140"))
+# Without the image's baseline the check could compute one at run time, but that costs
+# a full run of both halves: only for development outside the image.
+EC_RUNTIME_BASELINE = os.environ.get("BR_EC_RUNTIME_BASELINE", "0") == "1"
+_STARTED = __import__("time").monotonic()
+# Run a check only if dropping the test saves more than the check is expected to cost.
+EC_GAIN_FACTOR = 1.15
+EC_GAIN_MARGIN_S = 1.0
+
+
+class EarlyCut:
+    def __init__(self, tests: list[dict]) -> None:
+        import earlycut
+
+        self.mod = earlycut
+        self.src = str(SRC.resolve())
+        self.stage = earlycut.StageMap(EC_STAGE_PATH)
+        self.number = next((t["number"] for t in tests if t["id"] == earlycut.TPCDS_TEST), None)
+        self.base: str | None = None
+        self.front_cpu = 5.0
+        self.setup_cpu = 1.0
+        self.back_cpu: dict[int, float] = {}
+        self.tried_base = False
+        self.started = _wall()
+
+    def baseline(self) -> str | None:
+        if not self.tried_base:
+            self.tried_base = True
+            import tempfile
+
+            if EC_RUNTIME_BASELINE:
+                self.base = self.mod.ensure_baseline(self.src, str(EC_BASE_PATH), tempfile.gettempdir(), log)
+            else:
+                self.base = str(EC_BASE_PATH)
+            raw = self.mod.load_baseline(self.base) if self.base is not None else None
+            if raw is None:
+                self.base = None
+            else:
+                self.front_cpu = max(1.0, float(raw.get("cpu_s", 5.0)))
+                self.setup_cpu = float(raw.get("setup_cpu", 1.0))
+                self.back_cpu = {int(q): float(s) for q, s in raw.get("back_cpu", {}).items()}
+        return self.base
+
+    def plan(self, selector: "Selector"):
+        """What has to be re-run to decide the test for this patch: (front, queries),
+        or None when the early cutoff cannot decide it.
+
+        Only for patches whose every change is a statement inside a sqlglot function
+        body (never import-time code), and only when the stage map knows where the
+        test runs each of those functions."""
+        if not selector.prerun_ok or not selector.runtime_spots or not selector.new_sources:
+            return None
+        front, queries = False, set()
+        for path, _stmt_start, func_first, func_last in selector.runtime_spots:
+            where = self.stage.classify(path, func_first, func_last)
+            if where is None:
+                return None
+            front = front or where[0]
+            queries |= where[1]
+        return front, queries
+
+    def apply(self, selector: "Selector", numbers: list[int], ms: dict[int, int]) -> list[int]:
+        if self.number is None or self.number not in numbers:
+            return numbers
+        plan = self.plan(selector)
+        if plan is None:
+            log("  early cutoff: not decidable for this change")
+            return numbers
+        front, queries = plan
+        if queries and not EC_BACK:
+            log("  early cutoff: back-half change (re-execution is off)")
+            return numbers
+        without = [n for n in numbers if n != self.number]
+        saving = (commit_cost_ms(numbers, ms) - commit_cost_ms(without, ms)) / 1000
+        if self.baseline() is None:
+            log("  early cutoff: no baseline")
+            return numbers
+        if queries and not all(q in self.back_cpu for q in queries):
+            log("  early cutoff: baseline has no back-half results")
+            return numbers
+        per_query_front = self.front_cpu / 57
+        back = sum(self.back_cpu[q] for q in queries)
+        if front:
+            cost = self.front_cpu + ((self.setup_cpu + back) if queries else 0.0)
+        else:
+            cost = 0.6 + self.setup_cpu + back + per_query_front * len(queries)
+        if saving < EC_GAIN_FACTOR * cost + EC_GAIN_MARGIN_S:
+            log(f"  early cutoff: not worth it (saves {saving:.1f}s, costs ~{cost:.1f}s; front={front}, {len(queries)} queries)")
+            return numbers
+        diffs = EC_PLAN_DIFFS if (front and self.back_cpu) else 0
+        limit = cost + (EC_PLAN_DIFF_CPU_S + self.setup_cpu if diffs else 0.0)
+        job = {
+            "overrides": dict(selector.new_sources), "front": front, "queries": sorted(queries),
+            "max_plan_diffs": diffs, "plan_diff_cpu_s": EC_PLAN_DIFF_CPU_S,
+            # A patch that makes the code loop forever must not cost much: the child is
+            # stopped at about twice the expected CPU (rlimit) or 4x the expected wall time.
+            "cpu_limit_s": 1 + 2 * limit,
+        }
+        # The check's wall-clock timeout never reaches past the deadline; if what is left
+        # is not clearly enough for a normal run, the test is simply kept.
+        remaining = EC_DEADLINE_S - (_wall() - _STARTED)
+        wall_limit = min(5 + 4 * limit, remaining)
+        if wall_limit < 3 + 2 * limit:
+            log(f"  early cutoff: out of time budget ({remaining:.0f}s left, needs ~{limit:.0f}s)")
+            return numbers
+        log(f"  early cutoff: checking (front={front}, {len(queries)} queries to execute, ~{cost:.1f}s, saves {saving:.1f}s)")
+        if not self.mod.run_check(self.src, self.base, job, wall_limit_s=wall_limit, log=log):
+            return numbers
+        log(f"  early cutoff: identical -> dropping test_execute_tpcds (saves {saving:.1f}s)")
+        return without
+
+
+
+def _wall() -> float:
+    import time
+
+    return time.monotonic()
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -946,6 +1097,12 @@ def main() -> None:
         COSTS = PrerunCosts(COSTS_PATH)
         runner = prerun.Runner(str(SRC), log=log)
     nodeid_of = {t["number"]: t["id"] for t in tests}
+    early = None
+    if EARLYCUT and selector is not None and SRC.is_dir() and EC_STAGE_PATH.is_file():
+        try:
+            early = EarlyCut(tests)
+        except Exception as e:  # never a miss: without it every candidate is kept
+            log(f"early cutoff unavailable ({e!r})")
 
     for patch in sorted((DATA / "commits").glob("*.patch")):
         log(f"{patch.stem}:")
@@ -967,6 +1124,11 @@ def main() -> None:
                     numbers = try_prerun(runner, selector, numbers, ms, nodeid_of)
                 except Exception as e:  # never a miss: keep the full selection
                     log(f"  prerun error {e!r}; keeping all candidates")
+            if early is not None and numbers and not unmapped:
+                try:
+                    numbers = early.apply(selector, numbers, ms)
+                except Exception as e:  # never a miss: keep the full selection
+                    log(f"  early cutoff error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
         answers.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
