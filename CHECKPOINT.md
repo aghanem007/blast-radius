@@ -140,6 +140,14 @@ Waste breakdown on 126 labeled patches: 849 s total vs perfect; 530 s is test_ex
   only the packages the probe's tests need, and re-time the build.
 - Practice submission pending (user submits the hash). Not yet validated against the rare-input adversarial bugs.
 
+## Validation totals (Nov 21, ~01:30)
+
+Baseline sub-01 (selector/v2 @ 1a9a77b): **0 misses on 162 labeled patches** (30 samples, 77 slow-test
+[3 unlabelable infinite loops: m07013c, m07071c, m07075c; m07065c suspect = union label], 39 exotic
+[m11020t unlabelable: crashes pytest session], 2 cache adversarial, 14 proxy adversarial) + 0 misses on
+the 40 hidden practice commits. Proxy labeling stopped at 14/20 (already refuted: 5 counterexamples).
+Rare-input adversarial labeling: work/mutants_rare -> work/label_rare.json (running).
+
 ## FINAL ENTRY RULE
 
 The final defaults to the best practice score. The verified baseline is **sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9**
