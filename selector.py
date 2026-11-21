@@ -820,8 +820,21 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
             plan = probe.plan_probe(str(SRC / path), selector.source(path), new)
             if plan is not None:
                 order = sorted(cheap, key=lambda n: COSTS.test_ms(nodeid_of[n]))
-                out = prerun.probe_run(runner, path, plan, [nodeid_of[n] for n in order], 60 + 4 * sum(ms[n] for n in order) / 1000)
-                log(f"  PROBE {json.dumps(out)} tests={len(order)}")
+                cpu0 = _cpu()
+                out = prerun.probe_run(
+                    runner, path, plan, [nodeid_of[n] for n in order], 60 + 3 * COSTS.run_ms([nodeid_of[n] for n in order]) / 1000
+                )
+                cpu1 = _cpu()
+                slow = [n for n in numbers if ms[n] > 2000]
+                info = {
+                    "probe": out, "tests": len(order),
+                    "cpu_s": round(sum(cpu1) - sum(cpu0), 2),
+                    "est_s": round(COSTS.run_ms([nodeid_of[n] for n in order]) / 1000, 2),
+                    "schedule_all_s": commit_cost_ms(numbers, ms) / 1000,
+                    "schedule_without_slow_s": commit_cost_ms([n for n in numbers if ms[n] <= 2000], ms) / 1000,
+                    "slow": slow,
+                }
+                log(f"  PROBE {json.dumps(info)}")
         return numbers
 
     if AUDIT:

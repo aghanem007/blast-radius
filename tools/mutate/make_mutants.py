@@ -19,6 +19,7 @@ from __future__ import annotations
 import ast
 import difflib
 import io
+import json
 import random
 import re
 import sys
@@ -295,18 +296,24 @@ def one(rng: random.Random, kind: str, used: set[Path]) -> str | None:
 
 
 def main() -> None:
+    global FOCUS_ROWS
     out = Path(sys.argv[1])
     count = int(sys.argv[sys.argv.index("--count") + 1]) if "--count" in sys.argv else 100
     seed = int(sys.argv[sys.argv.index("--seed") + 1]) if "--seed" in sys.argv else 1
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     kinds = ["code"] * 16 + ["fixture"] * 8 + ["comment"] * 3 + ["multi"] * 3
+    if "--focus-lines" in sys.argv:
+        # Only code mutants, only on the given lines ({rel path: [lines]}): aimed tests,
+        # e.g. code test_execute_tpcds runs but its cheap proxy never does.
+        raw = json.loads(Path(sys.argv[sys.argv.index("--focus-lines") + 1]).read_text())
+        FOCUS_ROWS = {f: set(v) for f, v in raw.items()}
+        kinds = ["code"]
     if "--exotic" in sys.argv:
         kinds = list(EXOTIC) * 2 + ["testcode", "docstring", "delete"]
     if "--focus-big" in sys.argv:
         # Only code mutants, on lines a slow test (>= 2 s) runs: the data we need to
         # decide when skipping a slow test is safe.
-        global FOCUS_ROWS
         FOCUS_ROWS = load_focus(2.0)
         kinds = ["code"]
     made = 0
