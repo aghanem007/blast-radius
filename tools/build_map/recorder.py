@@ -92,6 +92,51 @@ def _prof(frame, event, arg):
             _cur_types.add(type(value))
 
 
+COLD = os.environ.get("BR_COLD", "0") == "1"
+
+
+def _import_everything() -> None:
+    """Import every sqlglot module now, before any test, so code that runs while a
+    module loads is recorded as import-time ("run everything" in the selector) instead
+    of being credited to whichever test happened to trigger a lazy import first."""
+    import importlib
+    import pkgutil
+
+    import sqlglot
+
+    for info in pkgutil.walk_packages(sqlglot.__path__, prefix="sqlglot."):
+        if info.name.endswith("__main__"):
+            continue
+        try:
+            importlib.import_module(info.name)
+        except Exception:
+            pass
+
+
+def _cold_caches() -> None:
+    """Reset sqlglot's per-process caches before each test, so every test runs the
+    code it depends on instead of reusing what an earlier test built. Without this,
+    a patch to _build_dispatch or Dialect._try_load breaks every test, but the map
+    credits that code only to the first test in each process."""
+    try:
+        import sqlglot
+        from sqlglot import generator
+        from sqlglot.dialects.dialect import DIALECT_MODULE_NAMES, Dialect
+
+        generator._DISPATCH_CACHE.clear()
+        loadable = set(DIALECT_MODULE_NAMES)
+        for key in list(Dialect._classes):
+            # Only dialects _try_load can register again; the base Dialect ("") stays.
+            if (key.value if hasattr(key, "value") else key) in loadable:
+                del Dialect._classes[key]  # Dialect.get / _try_load re-register it on use
+        schema = getattr(sqlglot, "schema", None)
+        for name, value in list(vars(schema).items()) if schema is not None else []:
+            if "cache" in name and isinstance(value, dict):
+                value.clear()
+    except Exception as e:  # never break the recording run over this
+        print(f"[recorder] cache reset failed: {e!r}", file=sys.stderr)
+
+
 def _switch(ctx: str | None) -> None:
     global _ctx, _cur_types
     _ctx = ctx
@@ -168,6 +213,8 @@ def pytest_configure(config) -> None:
     sys.addaudithook(_audit)
     sys.setprofile(_prof)
     threading.setprofile(_prof)
+    if COLD:
+        _import_everything()  # recorded under the "" context = import time
 
 
 @pytest.hookimpl(hookwrapper=True)
@@ -183,6 +230,8 @@ def _phase(item, name):
 
 @pytest.hookimpl(hookwrapper=True)
 def pytest_runtest_setup(item):
+    if COLD:
+        _cold_caches()
     _phase(item, "setup")
     yield
     _switch(None)

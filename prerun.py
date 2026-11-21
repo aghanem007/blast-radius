@@ -88,14 +88,27 @@ def _walk(co: types.CodeType, out: list) -> None:
             _walk(c, out)
 
 
+def _const_key(c):
+    """Exact type and value, recursively (see selector.const_key: (0,) == (False,))."""
+    if isinstance(c, types.CodeType):
+        return "<code>"
+    t = type(c)
+    if t is tuple:
+        return ("tuple", tuple(_const_key(x) for x in c))
+    if t is frozenset:
+        return ("frozenset", frozenset(_const_key(x) for x in c))
+    if t in (float, complex):
+        return (t.__name__, repr(c))
+    return (t.__name__, repr(c) if t not in (int, str, bytes, bool, type(None), type(...)) else c)
+
+
 def _own(co: types.CodeType):
     """What a code object does by itself, ignoring nested code and line numbers
     (including a class body's __firstlineno__ constant, which moves with comments)."""
     class_line = co.co_firstlineno if "__firstlineno__" in co.co_names else None
     consts = tuple(
-        "<code>" if isinstance(c, types.CodeType)
-        else "<firstlineno>" if type(c) is int and c == class_line
-        else (type(c).__name__, c)
+        "<firstlineno>" if type(c) is int and c == class_line
+        else _const_key(c)
         for c in co.co_consts
     )
     return (

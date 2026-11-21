@@ -34,8 +34,10 @@ IMAGE = "br-mapper"
 
 
 def mutated_files(patch_text: str) -> dict[str, str]:
-    """Return {repo path: new content} for every file the patch changes."""
+    """Return {repo path: new content} for every file the patch changes ("" = none)."""
     out = {}
+    if not patch_text:
+        return out
     for fp in selector.parse_patch(patch_text):
         if fp.new_path is None:
             raise RuntimeError(f"deleting {fp.old_path} is not supported by the labeler")
@@ -85,6 +87,50 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
     return {"failing": sorted(numbers), "unknown_failed": unknown}
 
 
+SUSPECT = ("BrokenProcessPool", "MemoryError", "Killed", "node down", "worker crashed")
+
+
+_BASELINE: dict | None = None
+
+
+def baseline(jobs: int) -> dict:
+    """The unpatched suite under the same conditions: must be 0 failing, no crashes."""
+    global _BASELINE
+    if _BASELINE is None:
+        got = label_one("_baseline", "", jobs)
+        log = (WORK / "_baseline" / "pytest.log").read_text(encoding="utf-8", errors="replace")
+        _BASELINE = {"failing": got["failing"], "crashed": any(m in log for m in SUSPECT)}
+    return _BASELINE
+
+
+def label_checked(cid: str, patch_text: str, jobs: int) -> dict:
+    """Label conservatively when a run shows a crashed process pool or worker.
+
+    A crash can be the patch (a serde bug breaks pickling, so the pool dies every
+    time) or the machine (out of memory while other jobs run), and repeating the
+    crash does not tell those apart. So nothing is ever thrown away: the label is the
+    UNION of every run's failures, marked suspect, with an unpatched baseline run
+    recorded for comparison. A union can only make our miss check stricter; it can
+    never hide a real failure. Misses on suspect labels are reviewed by hand."""
+    first = label_one(cid, patch_text, jobs)
+    log = (WORK / cid / "pytest.log").read_text(encoding="utf-8", errors="replace")
+    if not any(m in log for m in SUSPECT):
+        return first
+    second = label_one(cid, patch_text, jobs)
+    log2 = (WORK / cid / "pytest.log").read_text(encoding="utf-8", errors="replace")
+    base = baseline(jobs)
+    union = sorted(set(first["failing"]) | set(second["failing"]))
+    note = {
+        "suspect": True,
+        "runs": [len(first["failing"]), len(second["failing"])],
+        "second_crashed": any(m in log2 for m in SUSPECT),
+        "baseline_failing": len(base["failing"]),
+        "baseline_crashed": base["crashed"],
+    }
+    print(f"{cid}: SUSPECT {note}", file=sys.stderr, flush=True)
+    return {"failing": union, "unknown_failed": first["unknown_failed"], "note": note}
+
+
 def main() -> None:
     import threading
     from concurrent.futures import ThreadPoolExecutor
@@ -99,12 +145,14 @@ def main() -> None:
     def run(patch: Path) -> None:
         t0 = time.time()
         try:
-            got = label_one(patch.stem, patch.read_text(encoding="utf-8"), jobs)
+            got = label_checked(patch.stem, patch.read_text(encoding="utf-8"), jobs)
         except Exception as e:
             print(f"{patch.stem}: ERROR {e}", file=sys.stderr, flush=True)
             return
         with lock:
             answers[patch.stem] = {"failing": got["failing"], "kind": "generated"}
+            if "note" in got:
+                answers[patch.stem]["note"] = got["note"]
             out_path.write_text(json.dumps({"commits": answers}, indent=1))
         extra = f" (unmapped failures: {got['unknown_failed'][:3]})" if got["unknown_failed"] else ""
         print(f"{patch.stem}: {len(got['failing'])} failing in {time.time() - t0:.0f}s{extra}", file=sys.stderr, flush=True)

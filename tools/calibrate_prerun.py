@@ -108,10 +108,27 @@ def main(out_path: str) -> None:
             os.dup2(devnull, 1)
             out = {}
             try:
-                for nodeid in ids:
-                    t0 = cpu_self()
-                    prerun._run_unittests([nodeid], classes)
-                    out[nodeid] = round((cpu_self() - t0) * 1000)
+                # One suite for the whole module, as a real run does: class setup runs
+                # once (TestExecutor's takes ~2.4 s), and each test is timed on its own
+                # between startTest and stopTest. Setup goes to "<file>::__setup__".
+                import unittest
+
+                class Timed(unittest.TestResult):
+                    def startTest(self, test):
+                        super().startTest(test)
+                        self._t0 = cpu_self()
+
+                    def stopTest(self, test):
+                        super().stopTest(test)
+                        out[test.id()] = round((cpu_self() - self._t0) * 1000)
+
+                suite = unittest.TestSuite(classes[n](n.split("::")[2]) for n in ids)
+                by_uid = {classes[n](n.split("::")[2]).id(): n for n in ids}
+                t_all = cpu_self()
+                suite.run(Timed())
+                total = round((cpu_self() - t_all) * 1000)
+                out = {by_uid.get(k, k): v for k, v in out.items()}
+                out[f"{path}::__setup__"] = max(0, total - sum(out.values()))
             finally:
                 os.write(w, json.dumps(out).encode())
                 os._exit(0)

@@ -245,6 +245,24 @@ def _code_list(src: str) -> list | None:
     return found
 
 
+def const_key(c):
+    """A constant's identity by exact type and value, all the way down.
+
+    Plain == is not enough: (0,) == (False,), (1, 2) == (1, 2.0) and 0.0 == -0.0 are
+    all True in Python, yet each pair behaves differently. Containers are compared
+    element by element with their types; floats and complex numbers by repr."""
+    if isinstance(c, types.CodeType):
+        return "<code>"
+    t = type(c)
+    if t is tuple:
+        return ("tuple", tuple(const_key(x) for x in c))
+    if t is frozenset:
+        return ("frozenset", frozenset(const_key(x) for x in c))
+    if t in (float, complex):
+        return (t.__name__, repr(c))
+    return (t.__name__, repr(c) if t not in (int, str, bytes, bool, type(None), type(...)) else c)
+
+
 def _behavior(co):
     """What a code object does, ignoring line numbers (comments move lines around).
 
@@ -252,9 +270,8 @@ def _behavior(co):
     (__firstlineno__, used only by introspection), so that constant is ignored too."""
     class_line = co.co_firstlineno if "__firstlineno__" in co.co_names else None
     consts = tuple(
-        "<code>" if isinstance(c, types.CodeType)
-        else "<firstlineno>" if type(c) is int and c == class_line
-        else (type(c).__name__, c)
+        "<firstlineno>" if type(c) is int and c == class_line
+        else const_key(c)
         for c in co.co_consts
     )
     return (
@@ -683,7 +700,9 @@ class PrerunCosts:
     def run_ms(self, nodeids: list[str]) -> float:
         files = {n.split("::", 1)[0] for n in nodeids}
         total = sum(self.test_ms(n) for n in nodeids)
-        total += sum(self.startup_ms[f] for f in files)
+        # module startup: its class setup measured in a warm suite when we have it,
+        # else the cold child's cheapest test (which includes that setup)
+        total += sum(self.warm_ms.get(f"{f}::__setup__", self.startup_ms[f]) for f in files)
         total += sum(self.import_ms.get(f, 500) for f in files - self.imported)
         return COST_MARGIN * total + PRERUN_OVERHEAD_MS
 
