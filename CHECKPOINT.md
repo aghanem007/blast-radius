@@ -10,7 +10,7 @@ the earliest submission).
 | --- | --- |
 | Local repo | `C:\Users\Welco\Desktop\Hackathon\blast-radius` |
 | Remote (shared with Sergio) | https://github.com/Sergio33113/hackathon-1 (`origin`). **PRIVATE: must be made public to submit** |
-| **Current working version (submit candidate)** | branch `selector/v2`, commit `e031ecb6...` (`git rev-parse selector/v2`). Map only plus runner (prerun on by default in code; see decisions) |
+| **Current working version (submit candidate)** | branch `selector/v2`, commit `e031ecbe0e4889a4af95727d4606a4c3fb3c438c`. Map only plus runner (prerun on by default in code; see decisions) |
 | Review work in progress | branch `review/wip`, commit `4c9f9fc57735c645fd9c2de2ad0376f7cca02bca` (current checkout) |
 | Not yet submitted | Nothing has been submitted on the track page |
 | Strategy doc | https://claude.ai/artifact/S9GLzXzdo6H9Zxwvb26wyK |
