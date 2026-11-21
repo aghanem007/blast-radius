@@ -131,6 +131,21 @@ Waste breakdown on 126 labeled patches: 849 s total vs perfect; 530 s is test_ex
   no trigger -121 s; trigger est<=0.4-0.7x schedule +33..+41 s over 126 patches; 6/6 harmless verdicts correct.
   PENDING: 20 rare-input adversarial bugs (work/mutants_rare -> work/label_rare.json) must be audited before any decision.
 
+## Practice experiment: infection probe (Nov 21, ~01:00)
+
+- Branch `exp/probe` @ 1f0c94a64e8fdfea234391d02faf4069e8330fe1 (pushed, public). Probe on (trigger: estimate <= 0.5x
+  scheduling cost, CPU budget 0.7x, no probe after 90 s wall), cheap-test runner off, image installs requirements.lock.
+- Local, scorer sandbox, 142 labeled patches: probe 1599.4 s vs baseline 1608.5 s (0 misses both); samples 163.6 vs 176.9.
+- WARNING: clean no-cache build took 542 s here under heavy load (limit 600 s). Before ANY final use: trim the image to
+  only the packages the probe's tests need, and re-time the build.
+- Practice submission pending (user submits the hash). Not yet validated against the rare-input adversarial bugs.
+
+## FINAL ENTRY RULE
+
+The final defaults to the best practice score. The verified baseline is **sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9**
+(submission BB-5E85C0A3, 216.8 s, 0 misses). If an experiment scores better but is judged too risky, explicitly pick
+BB-5E85C0A3 as the final entry on the track page before Sun 11:00 AM ET.
+
 ## Next steps (in order)
 
 1. DONE (see Shipped). Was: when the candidate map finishes: (a) confirm `pytest.log` shows 0 FAILED (the test_enum fix);
