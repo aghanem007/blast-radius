@@ -158,6 +158,13 @@ sandbox re-check found one apparent baseline miss on rare `m22003c`, traced to a
 re-runs all fail only test_execute_tpcds (selected). Label corrected in work/label_rare.json (note kept).
 Open risk for any final use of the probe: build time (542 s under load vs 600 s limit) -> trim dependencies first.
 
+## Probe practice result (Sat 12:01 AM): negligible gain
+
+Submission BB-F7D24F70 = exp/probe @ 1f0c94a (tag sub-02-probe): **216.4 s**, 0 misses x3 (213.771 s simulated +
+2.62 s CPU) vs baseline BB-5E85C0A3 216.8 s (215.778 + 1.06). Gain 0.4 s: not worth the build-time risk (542 s
+under load vs 600 s), forks and test packages. DECISION PENDING USER: switch the final entry back to BB-5E85C0A3
+(the page auto-entered BB-F7D24F70 as "best score").
+
 ## FINAL ENTRY RULE
 
 The final defaults to the best practice score. The verified baseline is **sub-01 = 1a9a77bc3e94ea44473cc38d5ded159a8671cde9**
