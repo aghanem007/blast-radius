@@ -15,7 +15,7 @@ RUN mkdir -p /app/src \
     && rm /tmp/sqlglot.tar.gz \
     && python -m compileall -q /app/src/sqlglot /app/src/tests
 
-COPY selector.py prerun.py /app/
+COPY selector.py prerun.py probe.py /app/
 COPY maps/ /app/maps/
 # The run is as user nobody on a read-only disk: everything must be world-readable.
 RUN chmod -R a+rX /app

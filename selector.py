@@ -61,6 +61,7 @@ class Map:
         self.reads: dict[str, int] = raw["reads"]
         self.classes: dict[str, int] = raw["classes"]
         self.names: dict[str, int] = raw["names"]
+        self.import_names: set[str] = set(raw.get("import_names", ()))
         self.tests_by_file: dict[str, set[int]] = {}
         for i, nodeid in enumerate(self.tests):
             self.tests_by_file.setdefault(nodeid.split("::", 1)[0], set()).add(i)
@@ -456,6 +457,9 @@ class Selector:
                 return ALL
             if same_tree(old, alone):
                 continue
+            if self.only_adds_new_functions(old, alone):
+                log(f"  {path}: hunk only adds new, unused module-level functions -> none")
+                continue
             removed, after = hunk_changes(old_start, body)
             spots = [(ln, ln) for ln in removed] + [(a, a + 1) for a in after]
             for lo, hi in spots:
@@ -464,6 +468,36 @@ class Selector:
                     return ALL
                 out |= got
         return out
+
+    def only_adds_new_functions(self, old: str, new: str) -> bool:
+        """True when `new` is `old` plus module-level functions that cannot matter: no
+        decorators, constant defaults only, and a name no sqlglot code defines or reads.
+        Defining such a function runs nothing but the def itself."""
+        try:
+            a, b = ast.parse(old).body, ast.parse(new).body
+        except SyntaxError:
+            return False
+        dumps_a = [ast.dump(s) for s in a]
+        extra, i = [], 0
+        for s in b:
+            if i < len(a) and ast.dump(s) == dumps_a[i]:
+                i += 1
+            else:
+                extra.append(s)
+        if i != len(a) or not extra:
+            return False
+        known = set(self.m.names) | self.m.import_names
+        for s in extra:
+            if not isinstance(s, (ast.FunctionDef, ast.AsyncFunctionDef)) or s.decorator_list:
+                return False
+            defaults = s.args.defaults + [d for d in s.args.kw_defaults if d is not None]
+            if not all(isinstance(d, ast.Constant) for d in defaults):
+                return False
+            if s.returns is not None or any(arg.annotation is not None for arg in s.args.args):
+                return False  # annotations can be evaluated at definition time
+            if s.name in known or s.name in old:
+                return False
+        return True
 
     def statements(self, path: str, old: str) -> list[Stmt]:
         """The original file's statements, parsed once per run."""
@@ -529,6 +563,21 @@ class Selector:
             qual = f"{module_name(path)}.{cls_path}"
             users = m.set_of(m.classes, qual)
             if users is not None:
+                # A plain class attribute only matters to code that reads it by name.
+                # Narrow to the class's users that ran such code, unless the name is
+                # also read while modules load (a metaclass building tables from it, or
+                # another class copying it), where tests depend on it without reading it.
+                defined = defined_names(s.node)
+                if (
+                    isinstance(s.node, (ast.Assign, ast.AnnAssign, ast.AugAssign))
+                    and defined
+                    and not (defined & m.import_names)
+                ):
+                    readers = self.names_users(defined)
+                    if readers is not None:
+                        got = users & readers
+                        log(f"  {path}:{lo}: attribute {sorted(defined)} of {qual} -> {len(got)} tests (of {len(users)} users)")
+                        return got
                 log(f"  {path}:{lo}: class-level in {qual} -> {len(users)} tests using it")
                 return users
             got = self.names_users(defined_names(s.node))
@@ -589,9 +638,12 @@ def best_split(tests: list[tuple[int, int]]) -> list[list[int]]:
 PRERUN = os.environ.get("BR_PRERUN", "1") != "0"
 ELIDE_BIG = os.environ.get("BR_ELIDE", "0") == "1"  # giant-test skip: off until the data supports it
 AUDIT = os.environ.get("BR_AUDIT", "0") == "1"  # validation: log the runner's verdict on every cheap candidate
+PROBE_AUDIT = os.environ.get("BR_PROBE_AUDIT", "0") == "1"  # validation: log infection-probe results
+PROBE = os.environ.get("BR_PROBE", "0") == "1"  # infection probe: off until audited on enough patches
+PROBE_MIN_REACHED = 10
 CHEAP_MS = 1500  # tests at most this long may be run by us; longer ones are scheduled
 PRERUN_OVERHEAD_MS = 40  # fork and code swap, per patch
-COST_MARGIN = 1.15  # our CPU can vary from the calibration run
+COST_MARGIN = 1.35  # our CPU can vary from the calibration run (optimizer tests ran ~1.25x over)
 COSTS_PATH = Path(os.environ.get("BR_COSTS", APP / "maps" / "prerun_costs.json"))
 
 
@@ -607,6 +659,9 @@ class PrerunCosts:
         raw = json.loads(path.read_text())
         self.child_ms: dict[str, int] = raw["child_ms"]
         self.import_ms: dict[str, int] = raw["import_ms"]
+        # warm_ms: a test's CPU when run after the others of its module in one child
+        # (shared lazy setup already paid): the right per-test cost for a batch.
+        self.warm_ms: dict[str, int] = raw.get("warm_ms", {})
         self.imported: set[str] = set()
         # Each measurement = the module's one-time work in a fresh child (class setup,
         # lazy sqlglot init) + the test itself. Split them: a module's startup is its
@@ -621,6 +676,8 @@ class PrerunCosts:
         v = self.child_ms.get(nodeid)
         if v is None or v >= 10**6:
             return None
+        if nodeid in self.warm_ms:
+            return self.warm_ms[nodeid]
         return v - self.startup_ms[nodeid.split("::", 1)[0]]
 
     def run_ms(self, nodeids: list[str]) -> float:
@@ -676,6 +733,52 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
     if not cheap:
         return numbers
 
+    if PROBE and len(selector.new_sources) == 1:
+        # Infection probe (weak mutation): if the one changed expression runs many
+        # times across every cheap candidate test and never yields a different value
+        # than the original, the patch cannot change any outcome on those inputs:
+        # print nothing. Rare infections exist (1 in 469 in one labeled patch), so the
+        # probe covers all cheap candidates, never a sample of them.
+        import probe
+
+        (path, new), = selector.new_sources.items()
+        plan = probe.plan_probe(str(SRC / path), selector.source(path), new)
+        if plan is not None:
+            order = sorted(cheap, key=lambda n: COSTS.test_ms(nodeid_of[n]))
+            probe_cost = COSTS.run_ms([nodeid_of[n] for n in order])
+            schedule_cost = commit_cost_ms(numbers, ms)
+            if probe_cost < schedule_cost:
+                cpu0 = _cpu()
+                out = prerun.probe_run(
+                    runner, path, plan, [nodeid_of[n] for n in order], 15 + 3 * probe_cost / 1000,
+                    cpu_budget_s=0.8 * schedule_cost / 1000,
+                )
+                COSTS.imported |= {nodeid_of[n].split("::", 1)[0] for n in order}
+                cpu1 = _cpu()
+                log(f"  probe: {out} over {len(order)} tests, cpu {sum(cpu1) - sum(cpu0):.2f}s (expected {probe_cost / 1000:.2f}s, schedule {schedule_cost / 1000:.2f}s)")
+                if (
+                    out and out.get("complete") and not out["failed"]
+                    and out["infected"] == 0 and out["reached"] >= PROBE_MIN_REACHED
+                ):
+                    log(f"  probe: never infected in {out['reached']} evaluations -> none")
+                    return []
+            else:
+                log(f"  probe: not worth it (probe ~{probe_cost / 1000:.1f}s vs schedule {schedule_cost / 1000:.1f}s)")
+
+    if PROBE_AUDIT:
+        # Validation only: run an infection probe over the cheap candidates and log
+        # how often the changed expression ran and whether it ever changed value.
+        import probe
+
+        if len(selector.new_sources) == 1:
+            (path, new), = selector.new_sources.items()
+            plan = probe.plan_probe(str(SRC / path), selector.source(path), new)
+            if plan is not None:
+                order = sorted(cheap, key=lambda n: COSTS.test_ms(nodeid_of[n]))
+                out = prerun.probe_run(runner, path, plan, [nodeid_of[n] for n in order], 60 + 4 * sum(ms[n] for n in order) / 1000)
+                log(f"  PROBE {json.dumps(out)} tests={len(order)}")
+        return numbers
+
     if AUDIT:
         # Validation only: run every cheap candidate and log exactly what the runner
         # says, to compare test by test with labels from the real suite.
@@ -721,7 +824,7 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
     _, cheap, keep, run_cost, saving = best
     log(f"  prerun: expect cost {run_cost / 1000:.2f}s to save up to {saving / 1000:.2f}s")
 
-    deadline = 5 + 4 * sum(ms[n] for n in cheap) / 1000
+    deadline = 15 + 3 * run_cost / 1000
     by_nodeid = {nodeid_of[n]: n for n in cheap}
     cpu0 = _cpu()
     failed = runner.run(swaps, list(by_nodeid), deadline)

@@ -20,6 +20,7 @@ import ast
 import difflib
 import io
 import random
+import re
 import sys
 import tokenize
 from pathlib import Path
@@ -157,7 +158,129 @@ def mutate_comment(rng: random.Random, path: Path) -> str | None:
     return new
 
 
+# ----- exotic kinds: changes the samples never show, for the final's surprises
+
+
+def test_py_files() -> list[Path]:
+    return sorted(p for p in (SRC / "tests").rglob("*.py") if p.stat().st_size > 200)
+
+
+def mutate_docstring(rng: random.Random, path: Path) -> str | None:
+    """Change one word inside a docstring (sqlglot runs doctests in test_docs)."""
+    old = path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(old)
+    except SyntaxError:
+        return None
+    docs = []
+    for node in ast.walk(tree):
+        if isinstance(node, (ast.Module, ast.ClassDef, ast.FunctionDef, ast.AsyncFunctionDef)):
+            body = node.body
+            if body and isinstance(body[0], ast.Expr) and isinstance(getattr(body[0], "value", None), ast.Constant) \
+                    and isinstance(body[0].value.value, str):
+                docs.append(body[0])
+    if not docs:
+        return None
+    lines = old.split("\n")
+    d = rng.choice(docs)
+    rows = [r for r in range(d.lineno - 1, (d.end_lineno or d.lineno)) if re.search(r"\b[A-Za-z]{3,}\b", lines[r])]
+    if not rows:
+        return None
+    r = rng.choice(rows)
+    words = list(re.finditer(r"\b[A-Za-z]{3,}\b", lines[r]))
+    w = rng.choice(words)
+    repl = rng.choice(["SELECT", "foo", "x", w.group(0).upper(), w.group(0)[::-1]])
+    lines[r] = lines[r][: w.start()] + repl + lines[r][w.end():]
+    new = "\n".join(lines)
+    return new if new != old and tree_changed(old, new) else None
+
+
+def mutate_delete(rng: random.Random, path: Path) -> str | None:
+    """Delete one simple statement inside a function, replacing it with `pass`."""
+    old = path.read_text(encoding="utf-8")
+    try:
+        tree = ast.parse(old)
+    except SyntaxError:
+        return None
+    cands = []
+    for fn in ast.walk(tree):
+        if isinstance(fn, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            for st in ast.walk(fn):
+                if isinstance(st, (ast.Assign, ast.Expr, ast.AugAssign)) and st.lineno == st.end_lineno \
+                        and not (isinstance(st, ast.Expr) and isinstance(st.value, ast.Constant)):
+                    cands.append(st)
+    if not cands:
+        return None
+    st = rng.choice(cands)
+    lines = old.split("\n")
+    line = lines[st.lineno - 1]
+    lines[st.lineno - 1] = line[: len(line) - len(line.lstrip())] + "pass"
+    new = "\n".join(lines)
+    return new if tree_changed(old, new) else None
+
+
+def mutate_addfunc(rng: random.Random, path: Path) -> str | None:
+    """Append a new, unused module-level helper."""
+    old = path.read_text(encoding="utf-8")
+    name = f"_helper_{rng.randrange(10**6)}"
+    new = old.rstrip("\n") + f"\n\n\ndef {name}(value):\n    return value\n"
+    return new if tree_changed(old, new) else None
+
+
+def mutate_fixmeta(rng: random.Random, path: Path) -> str | None:
+    """Change a fixture's meta line (# dialect: / # execute:) or add a SQL comment."""
+    old = path.read_text(encoding="utf-8")
+    lines = old.split("\n")
+    meta = [i for i, l in enumerate(lines) if l.startswith("# dialect:") or l.startswith("# execute:")]
+    if meta and rng.random() < 0.6:
+        i = rng.choice(meta)
+        if lines[i].startswith("# dialect:"):
+            lines[i] = "# dialect: " + rng.choice(["duckdb", "bigquery", "snowflake", "postgres", "spark"])
+        else:
+            lines[i] = "# execute: " + ("false" if "true" in lines[i] else "true")
+    else:
+        sql_rows = [i for i, l in enumerate(lines) if l.strip() and not l.startswith(("#", "--"))]
+        if not sql_rows:
+            return None
+        i = rng.choice(sql_rows)
+        lines.insert(i, "-- note: keep this case")
+    new = "\n".join(lines)
+    return new if new != old else None
+
+
+def mutate_doc_file(rng: random.Random, path: Path) -> str | None:
+    old = path.read_text(encoding="utf-8")
+    return old.rstrip("\n") + "\n\nSee the changelog for details.\n"
+
+
+def doc_files() -> list[Path]:
+    return [p for p in (SRC / "README.md", SRC / "CHANGELOG.md", SRC / "CONTRIBUTING.md") if p.exists()]
+
+
+EXOTIC = {
+    "testcode": (test_py_files, lambda rng, p: mutate_code(rng, p)),
+    "docstring": (py_files, mutate_docstring),
+    "delete": (py_files, mutate_delete),
+    "addfunc": (py_files, mutate_addfunc),
+    "fixmeta": (fixture_files, mutate_fixmeta),
+    "docs": (doc_files, mutate_doc_file),
+}
+
+
 def one(rng: random.Random, kind: str, used: set[Path]) -> str | None:
+    if kind in EXOTIC:
+        files, fn = EXOTIC[kind]
+        pool = files()
+        for _ in range(50):
+            path = rng.choice(pool)
+            if path in used:
+                continue
+            new = fn(rng, path)
+            if new is not None:
+                used.add(path)
+                rel = path.relative_to(SRC).as_posix()
+                return as_patch(rel, path.read_text(encoding="utf-8"), new)
+        return None
     pool = fixture_files() if kind == "fixture" else py_files()
     for _ in range(50):
         path = rng.choice(pool)
@@ -178,6 +301,8 @@ def main() -> None:
     rng = random.Random(seed)
     out.mkdir(parents=True, exist_ok=True)
     kinds = ["code"] * 16 + ["fixture"] * 8 + ["comment"] * 3 + ["multi"] * 3
+    if "--exotic" in sys.argv:
+        kinds = list(EXOTIC) * 2 + ["testcode", "docstring", "delete"]
     if "--focus-big" in sys.argv:
         # Only code mutants, on lines a slow test (>= 2 s) runs: the data we need to
         # decide when skipping a slow test is safe.

@@ -91,7 +91,52 @@ def main(out_path: str) -> None:
         if i % 200 == 0:
             print(f"  {i}/{len(cheap)}", file=sys.stderr, flush=True)
 
-    json.dump({"import_ms": import_ms, "child_ms": child_ms}, open(out_path, "w"), indent=1, sort_keys=True)
+    # Warm costs: run each module's cheap tests back to back in one child, timing each
+    # test's CPU inside that child. A real run shares lazy initialisation between its
+    # tests, so a test's warm cost is what it adds once the module is going.
+    warm_ms = {}
+    by_file: dict[str, list[str]] = {}
+    for n in cheap:
+        by_file.setdefault(n.split("::", 1)[0], []).append(n)
+    for path, ids in by_file.items():
+        classes = runner.import_tests(ids)
+        r, w = os.pipe()
+        pid = os.fork()
+        if pid == 0:
+            os.close(r)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            out = {}
+            try:
+                for nodeid in ids:
+                    t0 = cpu_self()
+                    prerun._run_unittests([nodeid], classes)
+                    out[nodeid] = round((cpu_self() - t0) * 1000)
+            finally:
+                os.write(w, json.dumps(out).encode())
+                os._exit(0)
+        os.close(w)
+        chunks, deadline_ok = [], True
+        while True:
+            ready, _, _ = select.select([r], [], [], 600)
+            if not ready:
+                os.kill(pid, signal.SIGKILL)
+                deadline_ok = False
+                break
+            data = os.read(r, 1 << 16)
+            if not data:
+                break
+            chunks.append(data)
+        os.waitpid(pid, 0)
+        os.close(r)
+        if deadline_ok and chunks:
+            warm_ms.update(json.loads(b"".join(chunks)))
+        print(f"  warm {path}: {len(ids)} tests", file=sys.stderr, flush=True)
+
+    json.dump(
+        {"import_ms": import_ms, "child_ms": child_ms, "warm_ms": warm_ms},
+        open(out_path, "w"), indent=1, sort_keys=True,
+    )
     ratio = sorted(((child_ms[n] / max(1, secs[n] * 1000), n) for n in child_ms), reverse=True)[:5]
     print(f"modules {len(import_ms)}, tests {len(child_ms)}; worst CPU/recorded: {ratio}", file=sys.stderr)
 

@@ -291,6 +291,94 @@ class Runner:
             os.close(r)
 
 
+def probe_run(runner: "Runner", rel: str, plan, nodeids: list[str], deadline_s: float, cpu_budget_s: float = 1e9) -> dict | None:
+    """Run tests with an infection probe installed (see probe.py).
+
+    Returns {"reached": n, "infected": n, "failed": [...], "complete": bool} or None
+    on any trouble. It stops early at the first infection, or once the child has used
+    cpu_budget_s of CPU; "complete" says whether every test ran.
+    The instrumented function behaves exactly like the original, so "failed" should
+    be empty; anything else means the probe environment is off and is not trusted.
+    """
+    import probe as probe_mod
+
+    qual, line, code = plan
+    try:
+        runner.warm()
+        importlib.import_module(rel[:-3].replace("/", ".").removesuffix(".__init__"))
+        classes = runner.import_tests(nodeids)
+        fns = runner.function_index().get((os.path.join(runner.src_root, rel), qual, line), [])
+    except BaseException as e:
+        runner.log(f"    probe setup failed: {e!r}")
+        return None
+    if not fns:
+        return None
+    r, w = os.pipe()
+    pid = os.fork()
+    if pid == 0:
+        try:
+            os.close(r)
+            devnull = os.open(os.devnull, os.O_WRONLY)
+            os.dup2(devnull, 1)
+            sys.stdout = open(os.devnull, "w")
+            rec = probe_mod.Recorder()
+            for fn in fns:
+                fn.__globals__["__br_probe__"] = rec
+                fn.__code__ = code
+            # One infection settles it: stop at the first one instead of running on.
+            # The CPU budget protects against a cost estimate that came in low.
+            import resource
+
+            def used() -> float:
+                r = resource.getrusage(resource.RUSAGE_SELF)
+                return r.ru_utime + r.ru_stime
+
+            start, ran = used(), {"n": 0}
+
+            def stop() -> bool:
+                ran["n"] += 1
+                return rec.infected > 0 or used() - start > cpu_budget_s
+
+            failed = _run_unittests(nodeids, classes, stop=stop)
+            os.write(w, json.dumps({
+                "reached": rec.reached, "infected": rec.infected, "failed": sorted(failed),
+                "complete": ran["n"] >= len(nodeids),
+            }).encode())
+        except BaseException:
+            import traceback
+
+            traceback.print_exc(file=sys.stderr)
+        finally:
+            os._exit(0)
+    os.close(w)
+    chunks, end = [], time.monotonic() + deadline_s
+    try:
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                raise TimeoutError
+            ready, _, _ = select.select([r], [], [], left)
+            if not ready:
+                raise TimeoutError
+            data = os.read(r, 65536)
+            if not data:
+                break
+            chunks.append(data)
+        os.waitpid(pid, 0)
+        raw = b"".join(chunks).decode()
+        return json.loads(raw) if raw else None
+    except Exception as e:
+        runner.log(f"    probe child failed: {e!r}")
+        try:
+            os.kill(pid, signal.SIGKILL)
+            os.waitpid(pid, 0)
+        except OSError:
+            pass
+        return None
+    finally:
+        os.close(r)
+
+
 class _Result(unittest.TestResult):
     def __init__(self) -> None:
         super().__init__()
@@ -323,8 +411,15 @@ class _Result(unittest.TestResult):
     def addUnexpectedSuccess(self, test):
         self._mark(test)
 
+    stop_check = None
 
-def _run_unittests(nodeids: list[str], classes: dict[str, type]) -> set[str]:
+    def stopTest(self, test):
+        super().stopTest(test)
+        if self.stop_check is not None and self.stop_check():
+            self.stop()  # unittest checks shouldStop before each next test
+
+
+def _run_unittests(nodeids: list[str], classes: dict[str, type], stop=None) -> set[str]:
     suite = unittest.TestSuite()
     by_uid = {}
     for nodeid in nodeids:
@@ -332,6 +427,8 @@ def _run_unittests(nodeids: list[str], classes: dict[str, type]) -> set[str]:
         by_uid[test.id()] = nodeid
         suite.addTest(test)
     result = _Result()
+    if stop is not None:
+        result.stop_check = stop
     suite.run(result)
     failed = {by_uid[u] for u in result.bad if u in by_uid}
     for holder in result.bad_classes:

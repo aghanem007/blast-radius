@@ -139,7 +139,7 @@ def main(raw_dir: str, out_path: str) -> None:
             for n in names:
                 classes[n] |= who
 
-    names = build_name_index(lines, classes)
+    names, import_names = build_name_index(lines, classes, import_lines)
 
     out = {
         "tests": tests,
@@ -151,6 +151,10 @@ def main(raw_dir: str, out_path: str) -> None:
         "reads": {p: sets.add(ts) for p, ts in sorted(reads.items()) if ts},
         "classes": {c: sets.add(ts) for c, ts in sorted(classes.items()) if ts},
         "names": {n: sets.add(ts) for n, ts in sorted(names.items()) if ts},
+        # names read by function code that ran during import (metaclasses building
+        # tables from class attributes, module-level calls): a change to such a name
+        # can matter to tests that never read it themselves
+        "import_names": sorted(import_names),
     }
     out["sets"] = sets.items
     with gzip.open(out_path, "wt", compresslevel=9) as f:
@@ -164,16 +168,20 @@ def main(raw_dir: str, out_path: str) -> None:
 
 
 def refs_of(node) -> set[str]:
+    """Names a piece of code may read: plain names, attributes, and identifier-like
+    string constants (getattr(obj, "NAME") and friends)."""
     refs = set()
     for sub in ast.walk(node):
         if isinstance(sub, ast.Name):
             refs.add(sub.id)
         elif isinstance(sub, ast.Attribute):
             refs.add(sub.attr)
+        elif isinstance(sub, ast.Constant) and isinstance(sub.value, str) and sub.value.isidentifier():
+            refs.add(sub.value)
     return refs
 
 
-def build_name_index(lines, classes) -> dict[str, set[int]]:
+def build_name_index(lines, classes, import_lines) -> tuple[dict[str, set[int]], set[str]]:
     """For each name defined at module or class level, the tests that depend on it.
 
     A test depends on a name when it ran a function or lambda that refers to it, or
@@ -203,7 +211,11 @@ def build_name_index(lines, classes) -> dict[str, set[int]]:
                 units.append((rel, node.lineno, node.end_lineno or node.lineno, refs_of(node)))
 
     names: dict[str, set[int]] = defaultdict(set)
+    import_names: set[str] = set()
     for rel, start, end, refs in units:
+        ran_at_import = import_lines.get(rel, set())
+        if any(ln in ran_at_import for ln in range(start, end + 1)):
+            import_names |= refs
         wanted = refs & assigned
         if not wanted:
             continue
@@ -220,10 +232,13 @@ def build_name_index(lines, classes) -> dict[str, set[int]]:
                 names[n] |= covered
 
     for qualname, refs in class_refs:
+        import_names |= refs  # a class body read it while its module loaded
         users = classes.get(qualname)
         if users:
             for n in refs & assigned:
                 names[n] |= users
+    for _, used in module_refs:
+        import_names |= used  # a module-level statement read it at import
 
     # A module-level name built from another inherits its dependents.
     changed = True
@@ -239,7 +254,7 @@ def build_name_index(lines, classes) -> dict[str, set[int]]:
                 before = len(names[n])
                 names[n] |= dependents
                 changed |= len(names[n]) != before
-    return names
+    return names, import_names
 
 
 def collect_import_time_refs(body, module, cls, class_refs, module_refs) -> None:

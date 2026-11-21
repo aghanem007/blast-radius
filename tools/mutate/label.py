@@ -62,6 +62,8 @@ def label_one(cid: str, patch_text: str, jobs: int) -> dict:
         "-e", "PYTHONPATH=/sqlglot:/m", "-e", "FAIL_OUT=/out",
         *mounts,
         IMAGE, "python", "-m", "pytest", "tests", "-p", "failrec", "-p", "no:cacheprovider",
+        # Generous on purpose: we don't know the organizers' timeout, and labels must
+        # match theirs even when a mutant makes a test slow rather than stuck.
         "-n", str(jobs), "-q", "--timeout", "600",
     ]
     env = dict(os.environ, MSYS_NO_PATHCONV="1")
