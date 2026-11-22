@@ -1628,10 +1628,12 @@ def main() -> None:
 #   giant    the commit selects test_parser's test_max_nodes (28.8 s), or else
 #            test_execute_tpcds (21.5 s)
 #
-#   Each run reports one of two halves, picked at random (the half's number is part of
-#   the report), so that three runs usually show both:
-#     half A  simulated: giant commits by kind (at most 4), cost of runtime commits and
-#                        of test commits in 3 s steps
+#   A run reports one of two halves (the half's number is part of the report). The first
+#   submission of this branch (3ec8bfc) picked one at random per run and all three runs
+#   picked B; this one always reports A (B only if A cannot be carried):
+#     half A  simulated: giant commits by kind (at most 4), cost of runtime commits in
+#                        3 s steps, kinds of the commits of 8 s or more without a giant
+#                        (at most 3; import / runtime / other)
 #             CPU:       cost of import commits in 3 s steps, +64 if any commit ran everything
 #     half B  simulated: number of commits that cost nothing, and of import / runtime /
 #                        test commits that cost something; number of commits of 8 s or
@@ -1645,7 +1647,7 @@ def main() -> None:
 #     itself and its children is 30 + 0.25 * v.   (28 = the report could not be encoded)
 #   Decoder: work/exp_fronthalf/decode_diag2.py (not in the repository's image).
 DIAG = os.environ.get("BR_DIAG", "1") == "1"
-DIAG_CHUNK = os.environ.get("BR_DIAG_CHUNK", "")  # "A" or "B" to force a half (local tests)
+DIAG_CHUNK = os.environ.get("BR_DIAG_CHUNK", "A")  # the half to report: "A", "B", or "" for a random one
 DIAG_BASE_MS = 30_000
 DIAG_CPU_BASE_S = 30.0
 DIAG_CPU_STEP_S = 0.25
@@ -1665,6 +1667,17 @@ def diag_giant_codes() -> dict[tuple[int, ...], int]:
         for combo in itertools.combinations_with_replacement(range(8), size):
             codes[combo] = len(codes)
     return codes  # 495 of them; 495 itself means "more than 4"
+
+
+def diag_heavy_codes() -> dict[tuple[int, ...], int]:
+    """Every sorted list of at most 3 kinds (0 import, 1 runtime, 2 other) -> its number; 20 means more than 3."""
+    import itertools
+
+    codes: dict[tuple[int, ...], int] = {}
+    for size in range(4):
+        for combo in itertools.combinations_with_replacement(range(3), size):
+            codes[combo] = len(codes)
+    return codes
 
 
 def diag_count_rank(a: int, b: int, c: int, d: int, cap: int = 40) -> int:
@@ -1713,6 +1726,7 @@ class Diagnostic:
         cost, count = [0, 0, 0, 0], [0, 0, 0, 0]
         zero = heavy_n = heavy_ms = n_all = 0
         giants: list[int] = []
+        heavy_kinds: list[int] = []
         for _, numbers, _, kind, giant, is_all in self.rows:
             c = commit_cost_ms(numbers, self.ms)
             cost[kind] += c
@@ -1725,16 +1739,17 @@ class Diagnostic:
             elif c >= DIAG_HEAVY_MS:
                 heavy_n += 1
                 heavy_ms += c
+                heavy_kinds.append(min(kind, 2))
             n_all += bool(is_all)
         truth = {
             "commits": len(self.rows), "cost_s": {k: cost[i] / 1000 for i, k in enumerate(DIAG_KINDS)},
             "nonzero": {k: count[i] for i, k in enumerate(DIAG_KINDS)}, "zero": zero,
-            "giants": sorted(giants), "heavy_n": heavy_n, "heavy_s": heavy_ms / 1000, "all": n_all,
+            "giants": sorted(giants), "heavy_kinds": sorted(heavy_kinds), "heavy_n": heavy_n, "heavy_s": heavy_ms / 1000, "all": n_all,
         }
         if half == 0:
             g = diag_giant_codes().get(tuple(sorted(giants)), 495)
             r = min(63, round(cost[1] / 3000))
-            t = min(31, round(cost[2] / 3000))
+            t = diag_heavy_codes().get(tuple(sorted(heavy_kinds)), 20)
             content = (g * 64 + r) * 32 + t
             v = (64 if n_all else 0) + min(63, round(cost[0] / 3000))
         else:
