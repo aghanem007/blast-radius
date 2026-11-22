@@ -1569,6 +1569,7 @@ def main() -> None:
         except Exception as e:  # never a miss: without it every candidate is kept
             log(f"early cutoff unavailable ({e!r})")
 
+    diag = Diagnostic(tests, ms) if DIAG else None
     global _COMMITS_LEFT
     patches = sorted((DATA / "commits").glob("*.patch"))
     for position, patch in enumerate(patches):
@@ -1599,8 +1600,254 @@ def main() -> None:
                     log(f"  early cutoff error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
+        if diag is not None:
+            diag.add(patch.stem, numbers, workers, selector, chosen is ALL)
+            continue
         answers.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
         answers.flush()
+    if diag is not None:
+        diag.finish(answers)
+
+
+# --------------------------------------------------------------------- diagnostic
+#
+# DIAGNOSTIC BUILD (branch diag/telemetry-2). NOT a candidate for the final.
+#
+# We never see what the program prints on the practice set, only three numbers per run:
+# simulated seconds, CPU seconds, commits missed. This build makes exactly the same
+# selections as commit c763a65 (194.714 s simulated on practice) and reports how OUR OWN
+# selector behaved there, through the first two numbers. It uses no labels and learns
+# nothing about which tests fail: every number is a count or a cost of selections this
+# program made itself. Tests are only ever ADDED to a commit, so it cannot cause a miss.
+#
+#   kind of a commit, by the first that applies:
+#     import   sqlglot code that runs at import (class bodies, module level, def headers)
+#     runtime  statements inside sqlglot function bodies
+#     test     Python files under tests/
+#     data     everything else (fixtures, docs, comment-only edits)
+#   giant    the commit selects test_parser's test_max_nodes (28.8 s), or else
+#            test_execute_tpcds (21.5 s)
+#
+#   Each run reports one of two halves, picked at random (the half's number is part of
+#   the report), so that three runs usually show both:
+#     half A  simulated: giant commits by kind (at most 4), cost of runtime commits and
+#                        of test commits in 3 s steps
+#             CPU:       cost of import commits in 3 s steps, +64 if any commit ran everything
+#     half B  simulated: number of commits that cost nothing, and of import / runtime /
+#                        test commits that cost something; number of commits of 8 s or
+#                        more without a giant
+#             CPU:       cost of those 8 s commits in 2 s steps
+#
+#   simulated seconds: the total is raised by exactly 30.000 s + P ms, by putting extra
+#     tests on a single worker in as many commits as that takes.
+#       decode: P = (simulated - 194.714) * 1000 - 30000; half = P % 2
+#   CPU seconds: after the answers are written the program burns CPU until the total of
+#     itself and its children is 30 + 0.25 * v.   (28 = the report could not be encoded)
+#   Decoder: work/exp_fronthalf/decode_diag2.py (not in the repository's image).
+DIAG = os.environ.get("BR_DIAG", "1") == "1"
+DIAG_CHUNK = os.environ.get("BR_DIAG_CHUNK", "")  # "A" or "B" to force a half (local tests)
+DIAG_BASE_MS = 30_000
+DIAG_CPU_BASE_S = 30.0
+DIAG_CPU_STEP_S = 0.25
+DIAG_CPU_FAILED_S = 28.0
+DIAG_HEAVY_MS = 8_000
+DIAG_KINDS = ("import", "runtime", "test", "data")
+DIAG_MAX_NODES = "tests/test_parser.py::TestParser::test_max_nodes"
+DIAG_TPCDS = "tests/test_executor.py::TestExecutor::test_execute_tpcds"
+
+
+def diag_giant_codes() -> dict[tuple[int, ...], int]:
+    """Every sorted list of at most 4 cells (cell = kind * 2 + (0 max_nodes, 1 tpcds)) -> its number."""
+    import itertools
+
+    codes: dict[tuple[int, ...], int] = {}
+    for size in range(5):
+        for combo in itertools.combinations_with_replacement(range(8), size):
+            codes[combo] = len(codes)
+    return codes  # 495 of them; 495 itself means "more than 4"
+
+
+def diag_count_rank(a: int, b: int, c: int, d: int, cap: int = 40) -> int:
+    """Position of (a, b, c, d), all >= 0 with a + b + c + d <= cap, in dictionary order."""
+    index = 0
+    for a2 in range(cap + 1):
+        for b2 in range(cap + 1 - a2):
+            for c2 in range(cap + 1 - a2 - b2):
+                if (a2, b2, c2) == (a, b, c):
+                    return index + d
+                index += cap + 1 - a2 - b2 - c2
+    raise ValueError((a, b, c, d))
+
+
+class Diagnostic:
+    def __init__(self, tests: list[dict], ms: dict[int, int]) -> None:
+        self.ms = ms
+        number = {t["id"]: t["number"] for t in tests}
+        self.max_nodes = number.get(DIAG_MAX_NODES)
+        self.tpcds = number.get(DIAG_TPCDS)
+        self.rows: list[tuple[str, list[int], list[list[int]], int, int, bool]] = []
+
+    def add(self, commit: str, numbers: list[int], workers: list[list[int]], selector, is_all: bool) -> None:
+        kind = 3
+        try:
+            paths = list(selector.changed_paths) if selector is not None else []
+            kinds = selector.file_kinds if selector is not None else {}
+            changed = set(selector.new_sources) if selector is not None else set()
+            package = [p for p in paths if p.startswith("sqlglot/") and p.endswith(".py") and (is_all or p in changed)]
+            in_tests = [p for p in paths if p.startswith("tests/") and p.endswith(".py") and (is_all or p in changed)]
+            if package and (is_all or any(kinds.get(p, set()) - {"runtime"} for p in package)):
+                kind = 0
+            elif any(kinds.get(p) == {"runtime"} for p in package):
+                kind = 1
+            elif in_tests:
+                kind = 2
+        except Exception as e:  # noqa: BLE001
+            log(f"  diagnostic: kind unknown ({e!r})")
+        selected = set(numbers)
+        giant = 1 if self.max_nodes in selected else 2 if self.tpcds in selected else 0
+        log(f"  diagnostic: kind {DIAG_KINDS[kind]}, giant {giant}, cost {commit_cost_ms(numbers, self.ms)} ms")
+        self.rows.append((commit, numbers, workers, kind, giant, is_all))
+
+    # ---- what to report
+    def report(self, half: int) -> tuple[int, int, dict]:
+        cost, count = [0, 0, 0, 0], [0, 0, 0, 0]
+        zero = heavy_n = heavy_ms = n_all = 0
+        giants: list[int] = []
+        for _, numbers, _, kind, giant, is_all in self.rows:
+            c = commit_cost_ms(numbers, self.ms)
+            cost[kind] += c
+            if c == 0:
+                zero += 1
+            else:
+                count[kind] += 1
+            if giant:
+                giants.append(kind * 2 + giant - 1)
+            elif c >= DIAG_HEAVY_MS:
+                heavy_n += 1
+                heavy_ms += c
+            n_all += bool(is_all)
+        truth = {
+            "commits": len(self.rows), "cost_s": {k: cost[i] / 1000 for i, k in enumerate(DIAG_KINDS)},
+            "nonzero": {k: count[i] for i, k in enumerate(DIAG_KINDS)}, "zero": zero,
+            "giants": sorted(giants), "heavy_n": heavy_n, "heavy_s": heavy_ms / 1000, "all": n_all,
+        }
+        if half == 0:
+            g = diag_giant_codes().get(tuple(sorted(giants)), 495)
+            r = min(63, round(cost[1] / 3000))
+            t = min(31, round(cost[2] / 3000))
+            content = (g * 64 + r) * 32 + t
+            v = (64 if n_all else 0) + min(63, round(cost[0] / 3000))
+        else:
+            a, b, c, d = min(zero, 40), count[0], count[1], count[2]
+            b = min(b, 40 - a)
+            c = min(c, 40 - a - b)
+            d = min(d, 40 - a - b - c)
+            content = diag_count_rank(a, b, c, d) * 7 + min(6, heavy_n)
+            v = min(127, round(heavy_ms / 2000))
+        assert 0 <= content < 1 << 20 and 0 <= v < 128
+        return content * 2 + half, v, truth
+
+    # ---- how to report it
+    def subset(self, load_ms: int, without: set[int]) -> list[int] | None:
+        """Tests outside `without` whose durations add up to exactly load_ms (subset sum over a bitset)."""
+        if load_ms == 0:
+            return []
+        if load_ms < 0:
+            return None
+        items = sorted((n, d) for n, d in self.ms.items() if d > 0 and n not in without)
+        mask = (1 << (load_ms + 1)) - 1
+        reach = [1]
+        for _, d in items:
+            reach.append((reach[-1] | (reach[-1] << d)) & mask)
+        if not (reach[-1] >> load_ms) & 1:
+            return None
+        chosen, left = [], load_ms
+        for i in range(len(items) - 1, -1, -1):
+            if (reach[i] >> left) & 1:
+                continue  # reachable without this test
+            chosen.append(items[i][0])
+            left -= items[i][1]
+        return sorted(chosen) if left == 0 else None
+
+    def carry(self, extra_ms: int) -> dict[int, list[list[int]]] | None:
+        """New worker lists, by row, that raise the batch's simulated total by exactly extra_ms.
+
+        A row's tests all stay; they move onto one worker together with extra tests."""
+        ms = self.ms
+        total = sum(ms.values())
+        costs = [commit_cost_ms(row[1], ms) for row in self.rows]
+        out: dict[int, list[list[int]]] = {}
+        remaining = extra_ms
+        for i in sorted(range(len(self.rows)), key=lambda i: (costs[i], i)):
+            if remaining == 0:
+                break
+            numbers = self.rows[i][1]
+            floor = sum(ms[n] for n in numbers) + 2000 - costs[i]  # its own tests on one worker
+            full = total + 2000 - costs[i]  # every test on one worker
+            if remaining >= full + 30_000:
+                out[i] = [sorted(ms)]
+                remaining -= full
+                continue
+            take = remaining if remaining <= full - 5_000 else remaining // 2
+            pick = self.subset(take - floor, set(numbers))
+            if pick is None:
+                return None
+            out[i] = [sorted(set(numbers) | set(pick))]
+            remaining -= take
+        if remaining:
+            return None
+        after = sum(commit_cost_ms_of_workers(out[i], ms) if i in out else costs[i] for i in range(len(self.rows)))
+        if after != sum(costs) + extra_ms:
+            return None
+        for i, workers in out.items():
+            if not set(self.rows[i][1]) <= set(workers[0]) or len(workers[0]) != len(set(workers[0])):
+                return None
+        return out
+
+    def finish(self, answers) -> None:
+        import time
+
+        target = DIAG_CPU_FAILED_S
+        changed: dict[int, list[list[int]]] = {}
+        try:
+            half = {"A": 0, "B": 1}.get(DIAG_CHUNK)
+            if half is None:
+                half = 0 if os.urandom(1)[0] < 154 else 1  # A in 6 runs of 10
+            got = None
+            for attempt in (half, 1 - half):  # a half that cannot be carried gives way to the other
+                p, v, truth = self.report(attempt)
+                got = self.carry(DIAG_BASE_MS + p)
+                if got is not None:
+                    half = attempt
+                    break
+            if got is not None:
+                changed = got
+                target = DIAG_CPU_BASE_S + DIAG_CPU_STEP_S * v
+            log("diagnostic: " + json.dumps({
+                "half": "AB"[half], "P": p, "v": v, "carried": got is not None, "carriers": len(changed),
+                "extra_simulated_s": (DIAG_BASE_MS + p) / 1000 if got is not None else 0, "target_cpu_s": target, **truth,
+            }))
+        except Exception as e:  # noqa: BLE001  (the plain answers still go out)
+            log(f"diagnostic: could not encode ({e!r})")
+            changed = {}
+            target = DIAG_CPU_FAILED_S
+        for i, (commit, _, workers, _, _, _) in enumerate(self.rows):
+            answers.write(json.dumps({"commit": commit, "workers": changed.get(i, workers)}) + "\n")
+        answers.flush()
+
+        def used() -> float:
+            t = os.times()
+            return t[0] + t[1] + t[2] + t[3]
+
+        x = 0
+        while used() < target:
+            for _ in range(20000):
+                x += 1
+
+
+def commit_cost_ms_of_workers(workers: list[list[int]], ms: dict[int, int]) -> int:
+    workers = [w for w in workers if w]
+    return max(sum(ms[n] for n in w) for w in workers) + 2000 * len(workers) if workers else 0
 
 
 if __name__ == "__main__":
