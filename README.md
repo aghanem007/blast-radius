@@ -46,7 +46,21 @@ change can reach, or proves that a selected test cannot change outcome.
    Identical means the test cannot change outcome, so it is not scheduled. Any difference, error or
    timeout keeps it. (A second mode that re-executes only the queries a patch can reach is included,
    off by default.)
-5. **Pack.** Longest test first onto the least-loaded worker, trying 1 to 8 workers. This matches the
+5. **Comparison map (`maps/cmp.json.gz`; branch `exp/value-map`, experimental).** Coverage says which
+   tests ran a statement; it cannot say whether an edit changes anything for them. For comparisons we
+   record a little more at the pinned commit (`tools/build_map/cmprec.py`): for every comparison in
+   sqlglot (`a is b`, `a == b`, `a < b`, ...) and every test, how the two operands related when the
+   test ran: same object, equal, ordered. Each test is recorded alone in a fresh process (twice) and
+   in whole-suite runs in three different orders. A comparison about which those recordings disagree
+   (hash values, object ids, anything that depends on a cache or on what ran before) is flagged and
+   never used. When a patch only swaps a comparison operator, and only for `is` -> `==`,
+   `is not` -> `!=`, `<` <-> `<=` and `>` <-> `>=`, the tests that evaluated the comparison are
+   dropped if no test, in any recording, ever saw operands there on which the old and the new operator
+   give different answers, and neither operator can have a side effect on such operands. In every
+   other case all tests that ran the statement are kept. The map describes what the tests did at the
+   pinned commit. It holds nothing about patches or failing tests, and no patched code is ever run to
+   build it: whether a given patch can matter is worked out from the patch at decision time.
+6. **Pack.** Longest test first onto the least-loaded worker, trying 1 to 8 workers. This matches the
    lower bound on every commit we have measured.
 
 `prerun.py` and `probe.py` (run cheap candidate tests, or watch the changed expression, in a forked
@@ -94,3 +108,4 @@ samples, and `tools/mutate/label.py` labels them by running the real suite in th
 | BB-EA6DA914 | `5b51ebc` | `exp/class-attrs` | + class-attribute selection | 202.814 + 5.65 s, 0 | 208.5 |
 | BB-1E9B075A | `5083396` | `exp/module-level` | + module-level assignments, function headers, TPC-DS fixture | 194.714 + 20.16 s, 0 | 214.9 |
 | BB-401A9017 | `430d29b` | `exp/cheaper-checks` | + cheaper import-state check, executor-side early cutoff | 194.714 + 17.11 s, 0 | 211.8 |
+| BB-31607470 | `c763a65` | `exp/plan-diffs` | + fixes from two reviews, changed-plan queries re-executed, fixed gate costs | 194.714 + 12.90 s, 0 | 207.6 |

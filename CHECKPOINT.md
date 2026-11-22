@@ -627,6 +627,219 @@ fixed hash seed and in one process where the real test uses several.
 **Next:** user's go-ahead -> commit (no Claude attribution), clean rebuild of the commit + samples, push `exp/plan-diffs`,
 submit. If clean on practice it replaces 430d29b as preferred final candidate. PAGE PICK IS STILL BB-5E85C0A3.
 
+## 25. `exp/plan-diffs` SUBMITTED (BB-31607470, Sat 4:56 PM): 207.6 s, NEW BEST, no known holes
+
+User said "Yes, submit it". Commit `c763a65e7428de5fd824362684437cbfd8554ae1` (branch `exp/plan-diffs`, pushed; clean build of
+the commit 24 s; sandbox samples 126.999, insertions/review-2 400.922, review 99.175, tricky 245.049, all 0 misses;
+`noop_check.py` ALL SAME). Practice, all 3 runs: **194.714 s simulated, 12.68 / 12.90 / 12.95 s CPU, 0 missed -> 207.6 s.**
+- vs BB-401A9017 (430d29b, 211.8): simulated unchanged, CPU -4.2 s. Likely the early-cutoff changes (a check that finds a
+  difference now stops at the first differing query; fixed reference costs for the gate). Beats BB-EA6DA914 (208.5), which
+  has the module-level hole.
+- **Final pick on the page: BB-401A9017 (211.8 s).** The USER changed it there from BB-5E85C0A3 some time before 4:56 PM.
+  The page now says "You have scored 207.6 s. Unless you pick again, 211.8 s goes to the final" and offers "Make 207.6 s
+  our final entry". NOT clicked by Claude.
+- **Preferred final candidate is now BB-31607470 = `c763a65`** (best score AND the only build with the review fixes:
+  430d29b leaves out failing tests on test-file import-time edits, enum/class-line edits, renamed module-level names and
+  one execute() edit). Recommend the user switch the pick to it.
+- The page now allows 2 submissions per hour (1 of 2 left until ~5:56 PM).
+- README submission log has the new row in the working tree (not committed).
+
+## 26. FINAL PICK SWITCHED (Sat ~5:00 PM): the track page now enters BB-31607470 (207.6 s, commit `c763a65`)
+
+User said "Yes, switch it". Claude clicked "Pick as our final entry" on the BB-31607470 row in the signed-in built-in
+browser. Verified after a reload: "Entered in the final (your pick)" is on the BB-31607470 row, the "Your final entry is not
+your best score" warning is gone, and the other seven rows (BB-401A9017, BB-1E9B075A, BB-EA6DA914, BB-F4BEB122, BB-491EBE76,
+BB-F7D24F70, BB-5E85C0A3) are the ones that still offer a pick button.
+- **The pick is manual and sticky:** the page says "You picked your final entry, so a better score later will not replace
+  it unless you pick again." Any later build that should go to the final must be picked the same way, with the user's OK.
+- Do not rewrite or delete commit `c763a65` / branch `exp/plan-diffs` (the organizers keep their own copy, but leave it).
+- Still open for the hours left (cutoff Sun 11:00 AM ET), none of it started: a diagnostic submission (which giant tests
+  practice commits select, how many import-state checks, server speed); the reviews' sound score ideas (real
+  test_generator_memory run, TPC-DS on import-time edits, small candidate sets in the import-check child).
+
+## 27. Standing instructions from the user (Sat ~5:05 PM) and where things stand
+
+Pasted by the user after BB-31607470 was already scored and picked: "Keep all our previous submissions available. **Do not
+change our final selection automatically.** ... compare this version against our actual best-scoring submission, including
+the score, missed commits and known correctness risks. I want to win this competition, so let's prioritize the strongest
+overall final candidate, not just the newest version. After submitting, tell me what you think our best remaining
+optimization opportunity is and whether it's worth pursuing before the deadline."
+- The submission it asks for is BB-31607470 (already done, not repeated). The pick was switched to it on the user's explicit
+  "Yes, switch it" (section 26). From here on: NEVER change the pick without a fresh explicit yes.
+- All 8 submitted commits are on GitHub, each the tip of its own branch: 1a9a77b main / selector/v2 / tag sub-01, 1f0c94a
+  exp/probe / tag sub-02-probe, 38923fa exp/early-cutoff, 89112d3 diag/telemetry-1, 5b51ebc exp/class-attrs, 5083396
+  exp/module-level, 430d29b exp/cheaper-checks, c763a65 exp/plan-diffs. Never delete or force-push these branches.
+- Told the user: BB-31607470 is both the best-scoring and the safest build. Best remaining opportunity = the careful
+  "run small candidate sets ourselves; if all pass, schedule nothing" step (function-body half exists on `exp/trust-cheap`
+  as `BR_TRY_FIRST`, audited; import-time half must run inside the import-check child; needs test packages in the image).
+  Estimated -10 to -13 s on practice. Second: a diagnostic submission. Neither is started; waiting for the user's answer.
+
+## 28. Strategic gap analysis (Sat ~5:30 PM), asked for by the user BEFORE any more building. No code changed.
+
+User: top teams are at 114.6 s, we are at 207.6; "seriously reconsider our strategy instead of spending another three hours
+trying to save 10 seconds"; analysis first, no code changes, no expensive experiments, do not touch BB-31607470 (the pick).
+The careful small-test step they had just approved is ON HOLD until they choose a direction.
+
+**Leaderboard (public page, 332 teams):** 114.6, 118.8, 124.8, 126.1, 126.3, 127.6, 127.7, 127.7, 128.3, 131.1, ...;
+9 under 130, 23 under 140, 31 under 150; median 212.9; we are about 160th.
+
+**Official samples (`work/exp_fronthalf/gap_analysis.py sample <run> detail`, `mutation_kinds.py`):**
+- Minimum possible = **94.4 s** = 40.0 s worker start-up (20 workers x 2 s) + 54.4 s of failing tests; 51 s of it is two
+  commits (2jrq, 3utz) where test_execute_tpcds really fails. We schedule 127.0 s and spend ~24.5 s CPU = 151.5.
+- On the 18 commits where something fails we are at 94.7 vs 94.4. ALL 32.6 s of excess is on 8 commits that break nothing
+  ("survived" edits): 4d63 9.1, 2haz 8.7, 66ks 3.3 (+14.8 CPU), 2qn5 2.5, 5y72 2.5, fryt 2.2, ktz3 2.1, gbav 2.0.
+- 12 of the 30 sample commits break nothing; of the 19 code commits, 8 do. Coverage tells us which tests REACH an edit,
+  not whether the edit changes anything for them: that is the fundamental limit of the current design.
+- By kind of edit: **comparison operator (is/==, </<=, ==/!=): 5 commits, 5 break nothing**, 16.7 s scheduled + ~19 s CPU;
+  True/False flips 4 commits, 3 break nothing; boolean operator 3 commits, all break something (55.3 = minimum).
+  Our own sets agree: trap set comparison edits 14 commits, 12 break nothing, 146 s scheduled vs 7.7 minimum.
+- Scheduling is optimal; giant tests are selected on the samples only when they really fail.
+- Practice: only totals are visible (194.7 + 12.9). Scaled sample minimum would be ~126 s, and the leaders are at 114.6:
+  they are at or within a few seconds of the practice minimum. Our excess on practice is ~85 s of tests + 12.9 CPU, about
+  twice what the samples predict; the extra is practice-specific and invisible without a diagnostic.
+
+**Ideas ranked for the user (none started):**
+1. Value-aware map ("does the edited comparison evaluate differently?"): record at the pinned commit, per test, what each
+   comparison evaluated to under the alternative operators; drop tests where old and new operator agree on every recorded
+   evaluation. Would settle 66ks, 2haz, 2qn5 on the samples (~33 s incl. their CPU). ~5 h. Rules: a map of runtime values
+   from the pinned commit, arguably allowed, must be disclosed; sound up to side effects of `__eq__`.
+2. Run small covering sets ourselves (careful, half built): ~9 s on samples, ~3 h.
+3. Finer maps for class settings (which table entry / flag is actually used): 4d63 on samples; the import-time bucket on
+   practice; 5-8 h, hardest to validate.
+4. Diagnostic submission to see WHICH of 1-3 the practice commits need (kinds of edit, seconds per kind).
+5. Rejected: trusting cheap tests / budgets (measured misses), precomputed edit->tests tables (forbidden by the rules).
+Told the user plainly: 1+2+3 could take the samples from 151.5 to roughly 110 (minimum 94.4); first place needs being at the
+minimum with ~0 CPU, which no method I can call safe and legal reaches.
+
+## 29. Idea A proof of concept: the COMPARISON MAP (branch `exp/value-map`, from c763a65; STAGED, nothing committed)
+
+User (Sat ~5:15 PM): pursue the value-aware map; small proof of concept for comparison-operator edits (is/==, ==/!=,
+</<=) first; follow the rules ("we can precompute general test behavior and dependency information, but we cannot
+precompute specific patch-to-failure answers"); validate on labels and adversarial cases; measure CPU-adjusted savings; then
+say what a diagnostic would add. No submission, no change of the final pick (BB-31607470) without asking.
+
+**What it is.** `tools/build_map/cmprec.py` (pytest plugin, offline): sqlglot is compiled from a rewritten syntax tree in
+which every single-operator comparison `L op R` (is, is not, ==, !=, <, <=, >, >=) becomes `__br_cmp__(site, L, R, op)`,
+which returns what the original returns and notes, for the running test, how L and R RELATED: same object, equal, ordered
+(7 fields, one per operator, each False / True / unknown). A field other than the operator really used is filled in only
+when evaluating that operator on those operands cannot have a side effect (built-in values, enum members, default identity
+`__eq__`, a sqlglot expression against another type); otherwise "unknown". A comparison that raises is recorded as RAISED.
+It records what tests did at the pinned commit; it knows nothing about patches or failures.
+`cmp_isolated.py` runs every test alone in a fresh process (1620 tests, ~9 min at 12 jobs; test_max_nodes 253 s);
+a whole-suite pass (`pytest tests -p cmprec -n 8`, 150 s) adds what tests see with warm caches;
+`build_cmp_map.py <iso parts> maps/cmp.json.gz <warm dir>` -> the union: 1619 tests, 1888 comparison sites, 107 KB.
+Needs `PYTHONPYCACHEPREFIX=<folder used only by these runs>` (the rewritten bytecode is cached there).
+`tests/dialects/test_dialect.py::TestDialect::test_lazy_load` starts `python -c "import sqlglot"` in a subprocess, which
+cannot see the recorder: it has no recording and is therefore never dropped. All other 1619 tests pass instrumented.
+Check (`work/exp_fronthalf/cmp_coverage.py`): sqlglot has 1950 such comparisons, 1881 on lines tests run, 1870 in the map.
+
+**Selector** (`comparison_swaps`, `CmpMap`, `BR_CMP`, `BR_CMP_MAP`): when a file's only change is the operator of
+single-operator comparisons inside function bodies, each test that ran the statement is kept unless it has a recording, has
+a record at that comparison, and on every relation it saw there the old and new operator give the same known answer. No
+record at the comparison -> kept. New operator `is` / `is not` against a literal -> rule not used.
+
+**Results so far (image `br-vm`, tree 74c84e5, before the RAISED / literal fixes):**
+- Official samples, idle: **126.999 + 23.4 CPU = 150.4  ->  112.456 + 5.2 CPU = 117.6**, 0 misses. 2haz (is -> ==) 86 tests
+  -> 0; 66ks (is None -> == None) 51 -> 0 and its 14.8 s executor check is gone; 2qn5 (< -> <=) 6 -> 0; fryt (== -> !=) kept.
+- Labeled sets (run while the labeler was busy, so only misses and selections count): rule used on 35 commits (samples 5,
+  eval_big 7, trap 14, proxy 5, rare 4): **0 misses**; all tests dropped on 14, some on 6 (e.g. m07000c keeps exactly the 2
+  failing of 33, t71o007 exactly the 4 failing of 9), none on 14. `is -> ==`: 15 commits, all 15 break nothing.
+- 60 new comparison-only patches `work/mutants_cmp` (`make_cmp_mutants.py`, 30 random + 30 on lines shared by a giant test
+  and cheap tests; 16 are `== -> is`): being labeled into `work/label_cmp.json`.
+- Re-recording with the RAISED fix into `work/cmp_out2` (container `cmp-iso2`); then the warm pass, rebuild map and image,
+  full idle validation of every labeled set.
+
+## 30. Comparison map VALIDATED (Sat 18:45). STAGED tree `0667f25f2f0433273474cb1a3f63f985bce7dcb3` on `exp/value-map` (image `br-vm`). NOT committed / pushed / submitted. Final pick untouched (BB-31607470).
+
+Recorder tightened after section 29 and everything re-recorded into `work/cmp_out2` (iso 1620 parts + warm):
+- a relation field is filled in only when evaluating THAT operator on those operands is free of side effects, the operator
+  the code really uses included (an `==` that hashes or lazily loads a dialect is not interchangeable with `is`);
+- a comparison that raises is recorded as RAISED (the selector keeps the test);
+- selector: new operator `is` / `is not` against a literal -> rule not used.
+Map: 1619 tests, 1888 sites, 58 relation sets, 107 KB. `test_lazy_load` (subprocess) has no recording: never dropped.
+
+**Idle, scorer sandbox, tests + CPU, comparison map off -> on (`BR_CMP=0` vs default), 0 misses everywhere:**
+| Set | off | on | saved |
+| --- | --- | --- | --- |
+| 30 official samples | 126.999 + 23.3 = 150.3 | 112.456 + 5.1 = **117.5** | **32.8** |
+| 60 comparison-only patches (`work/mutants_cmp`, labels `label_cmp.json`; 30 random + 30 on giant-test lines) | 620.6 + 118.9 = 739.5 | 314.5 + 88.4 = 402.9 | 336.6 |
+| eval_proxy (14) | 279.7 | 267.9 | 11.8 |
+| eval_rare (20) | 282.5 | 283.0 | -0.5 |
+| eval_big (71), vs c763a65 | 968.2 | 929.3 | 38.9 |
+| eval_trap (56), vs c763a65 | 1031.5 | 830.5 | 201.0 |
+Sets the rule does not touch (exotic, review, insertions, module, header, fixture, tricky, class): same simulated seconds,
+CPU within noise (+0.5..3.5 s over 12-120 commits). `noop_check.py` ALL SAME. **528 labeled patches, 0 misses.**
+Rule used on 85 labeled commits (`cmp_effect.py`): all tests dropped on 29, some on 17, none on 38; their scheduled cost
+898.7 -> 465.6 s. By swap: is -> == 29 commits (all 29 break nothing) 327.2 -> 85.7; is not -> != 12 (all break nothing)
+94.4 -> 55.4; == -> is 6 (all break nothing) 55.9 -> 4.6; == -> != 13 (1 breaks nothing) 142.6 -> 103.2 with every failing
+test kept; != -> == 6, is not -> is 3: nothing dropped. Of the 60 new comparison patches 37 break nothing.
+
+**Remaining risks:** (1) like the coverage map, the recordings are one cold run per test plus one warm suite order; a test
+that only under another order compares different operands there is not covered. (2) "No side effect" is decided from the
+operands' types (`__eq__` identity); a class with a default `__eq__` but a custom `__ne__`/ordering would fool it (none in
+sqlglot today). (3) The pool-based TPC tests were recorded in-process, the real ones use spawned workers. (4) Rules: it is
+a map of what tests did at the pinned commit, disclosed in the README; it holds no patch, kind of edit or failing test.
+**Not known:** how many practice commits are comparison-operator edits. Samples: 5 of 30. Submitting THIS build measures
+it directly (new total vs 194.714 + 12.9); a separate diagnostic would only add a breakdown of what remains.
+**Next candidates (not started):** run small covering sets ourselves (samples: 5y72, fryt, ktz3, gbav = 8.8 s more);
+finer class-setting maps (4d63 9.1 s).
+
+## 31. Claude 2's audit of the comparison map (Sat ~18:45) and the conservative fixes. STAGED tree `068cfac5c8a5d6a25fb9b6a257f46ba0d5f3b3e1` (image `br-vm`), nothing committed.
+
+**User, mid-turn (18:56): "Precomputing which tests fail for specific patches or kinds of edits, then using that information
+during scoring. we gotta do this to help us too".** DECLINED and told the user: that is exactly what the rules forbid
+(KIT_README: "No answers worked out ahead of time and looked up by patch: no table from a patch, or from a kind of edit, to
+the tests it breaks"), it is the line the user drew themselves an hour earlier, the organizers read the top entries so it
+risks the whole entry, and it is fragile on the final's unseen kinds of change. Do not build it in any later session either.
+
+**Findings and what was done:**
+1. Hash / id comparisons differ between recordings: CONFIRMED by a third isolated recording (`work/cmp_out3`): 53 of
+   306,401 (test, site) pairs differ, at 3 sites (`expressions/core.py:838` hash==hash, `helper.py:182`,
+   `expressions/datatypes.py:445`). Fix: `build_cmp_map.py` (map version 2) FLAGS a site when two isolated recordings of a
+   test differ there; the selector never uses a flagged site. Plus a static rule: an operand that calls `hash()` / `id()` or
+   whose name contains "hash" -> rule not used.
+2. `cmprec.py:78` looks up `Expr.__eq__` but `__eq__` is defined on `Expression(Expr)`: CONFIRMED BUG, harmless direction:
+   every comparison with a sqlglot expression operand is "unknown", so its tests are always kept. NOT fixed (it would add
+   drops and needs a new recording and validation). Possible later gain.
+3. Other test orders add relations: CONFIRMED. Three whole-suite recordings (8 workers; 4 workers grouped by file; one
+   process with files in reverse order) add 239, 9 and 41 relations a test never shows alone, at 10 sites in all (dispatch
+   cache `generator.py:1006`, lazy dialect loading `dialect.py:221/232/254`, hashes, ...). Not converged: each new order may
+   add a few. Fixes: (a) those sites are flagged; (b) default `BR_CMP_MODE=site`: tests are dropped at a comparison only
+   when NO recorded test in ANY recording ever saw operands on which the two operators disagree (`test` mode = each test by
+   its own operands, kept for comparison only). Map now: 1619 tests, 1888 sites, 11 flagged.
+4. Literals (`-1`, tuples): made moot: swaps TOWARDS `is` / `is not` are no longer used at all. Allowed swaps only:
+   is -> ==, is not -> !=, < <-> <=, > <-> >= (their answers differ only when the operands are equal, or equal without
+   being one object; nothing depends on which operand is larger).
+5. Rules: see the user-facing answer. Arguably a "map built from the pinned commit" (no patch is ever run to build it),
+   but it is designed around operator swaps and only the organizers can settle it. Fine to measure on PRACTICE; whether to
+   make it the FINAL pick is a separate decision for the user (ideally after asking the organizers).
+Timing: Claude 2 ran heavy tests 18:05-18:16; my timed runs were 17:33 and 18:26-18:42 and after 19:02: no overlap. The
+labels of `work/mutants_cmp` WERE made during that window, so every dropped test is being re-run with real pytest
+(`work/exp_fronthalf/drop_audit.py <patch dir> <work dir> br-vm`, results `work/da_*/drop_audit.json`).
+After the fixes, idle: samples off 150.3 / site 117.6 / test 117.6; comparison set (60) off 738.3 / site 485.5 /
+test 468.4; 0 misses.
+
+## 32. Comparison map after the audit fixes: VALIDATED (Sat 19:30). STAGED tree `2b798323f849583245fc7caeb4b30730a7e62cdd` on `exp/value-map` (image `br-vm`). NOT committed / pushed / submitted. Final pick untouched (BB-31607470).
+
+Map `maps/cmp.json.gz` version 2: built by `python tools\build_map\build_cmp_map.py maps\cmp.json.gz --iso
+work\cmp_out2\iso\parts --iso work\cmp_out3\iso\parts --warm work\cmp_out2\warm --warm work\cmp_out3\warm_b --warm
+work\cmp_out3\warm_c` = 1619 tests, 1888 sites, 11 flagged, 110 KB. Selector default `BR_CMP_MODE=site`.
+**Idle, scorer sandbox, tests + CPU, without the map -> with it, 0 misses on all 528 labeled patches:**
+samples 126.999 + 23.3 = 150.3 -> 112.456 + 5.2 = **117.6** (saved 32.7; nothing lost to the fixes);
+comparison set (60) 738.4 -> 487.6 (was 402.9 before the fixes); trap (56) 1031.6 -> 835.0; big (71) 968.2 -> 938.6;
+proxy 279.7 -> 272.4; rare 282.5 -> 281.9; exotic, review, insertions, module, header, fixture, tricky, class: identical
+selections. `noop_check.py` ALL SAME.
+**Real-test audit of every drop (`drop_audit.py`, real pytest in br-mapper, idle): 1,202 dropped tests on 28 patches
+(samples 143 on 3, comparison set 954 on 13, trap 45 on 9, big 21 on 2, proxy 39 on 1): 0 fail.** This does not depend on
+the labels that were made while Claude 2's tests were loading the machine.
+**Residual risks (told to the user):** other test orders can still add relations (three orders gave 239, 9, 41 new ones;
+not converged), which the site-level rule and the flags reduce but cannot exclude; side-effect freedom is judged by operand
+types; the pool-based TPC tests were recorded in one process; and rule compliance is an interpretation only the organizers
+can confirm. Known harmless bug left in: `cmprec.py` looks at `Expr.__eq__` instead of `Expression.__eq__`, so comparisons
+with a sqlglot expression operand are never used (fix = new recording + validation, more drops).
+**Recommendation given:** fine to commit, push and submit to PRACTICE to measure it on the real commits; keep BB-31607470
+as the final pick until the user decides about the rules question (suggested: ask the organizers a neutral question).
+
 # >>> END OF HANDOFF. Full history below. <<<
 
 

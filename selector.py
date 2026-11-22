@@ -399,6 +399,10 @@ class Selector:
         self.file_kinds: dict[str, set[str]] = {}
         self._test_importers: dict[str, set[str]] | None = None
         self._class_base_path = str(CA_BASE_PATH)
+        # The comparison map (CmpMap) and, per patch and file, the comparisons whose
+        # operator is the file's only change: (line, col, end line, end col, old, new).
+        self.cmp: "CmpMap | None" = None
+        self.cmp_swaps: dict[str, list[tuple]] = {}
         self._name_lines: dict[str, set[tuple[str, int]]] | None = None
         self.class_spots: list[tuple[str, set[str], set[int] | None, set[int] | None]] = []
         # Per patch: every file it touches, and the new text of changed data files we
@@ -420,6 +424,7 @@ class Selector:
         self.runtime_spots = []
         self.class_spots = []
         self.header_floor = set()
+        self.cmp_swaps = {}
         self.file_kinds = {}
         self.place_calls = 0
         self.changed_paths = []
@@ -651,6 +656,10 @@ class Selector:
             log(f"  {path}: same compiled code (comments/formatting) -> none")
             return set()
         self.new_sources[path] = new
+        if self.cmp is not None and path.startswith("sqlglot/"):
+            swaps = comparison_swaps(old, new)
+            if swaps:
+                self.cmp_swaps[path] = swaps
 
         stmts = self.statements(path, old)
         out: set[int] = set()
@@ -800,6 +809,17 @@ class Selector:
                 return ALL
             got = m.line_tests(path, s.start, s.end)
             log(f"  {path}:{lo}: runtime statement {s.start}-{s.end} -> {len(got)} tests")
+            swaps = [w for w in self.cmp_swaps.get(path, ()) if s.start <= w[0] <= s.end]
+            if swaps and self.cmp is not None:
+                # The file's only change is the operator of these comparisons. A test in
+                # which the old and the new operator agree on every pair of operands it
+                # ever compared here computes exactly what it computed before.
+                kept = self.cmp.narrow(path, got, swaps)
+                if kept is None:
+                    log(f"  {path}:{lo}: comparison operator changed, but the comparison map has no record of it: all {len(got)} kept")
+                else:
+                    log(f"  {path}:{lo}: comparison operator {swaps[0][4]} -> {swaps[0][5]}: {len(kept)} of {len(got)} tests ever saw operands on which they differ")
+                    got = kept
             outer, p = s.func, s.parent
             while p is not None:
                 if isinstance(p.node, (ast.FunctionDef, ast.AsyncFunctionDef)):
@@ -1275,6 +1295,180 @@ def try_prerun(runner, selector: "Selector", numbers: list[int], ms, nodeid_of) 
 # maps/attr.json.gz (which tests READ which class attribute, recorded per test in
 # isolation by tools/build_map/attrrec.py) and classstate.py (which attributes a patch
 # changes once everything is imported), only the tests that read a changed attribute run.
+# ------------------------------------------------------------- comparison map
+
+# EXPERIMENT (branch exp/value-map). The coverage map says which tests RAN a statement.
+# maps/cmp.json.gz (tools/build_map/cmprec.py, recorded at the pinned commit, every test
+# alone and once more in a whole-suite run) adds, for every comparison in sqlglot, how
+# its two operands related in each test: same object, equal, ordered. It records what
+# the tests did, nothing about any patch.
+# When a patch only swaps a comparison operator (`is` -> `==`, `<` -> `<=`, ...), a test
+# keeps computing exactly what it computed if, for every pair of operands it compares
+# there, the old and the new operator give the same answer AND evaluating either operator
+# on such operands has no side effect (the recorder only fills in an operator's answer
+# when that holds). What a test compares can depend on what ran before it (caches, lazy
+# loading) and on the process (hashes, ids), so the map is used cautiously:
+#   - a comparison about which the recordings disagree is flagged in the map: never used;
+#   - by default (BR_CMP_MODE=site) tests are dropped only when NO test in ANY recording
+#     saw operands there on which the two operators disagree or are unknown;
+#   - a test with no record at the comparison is always kept.
+CMPMAP = os.environ.get("BR_CMP", "1") == "1"
+CMP_MAP_PATH = Path(os.environ.get("BR_CMP_MAP", APP / "maps" / "cmp.json.gz"))
+_CMP_OPS = {ast.Is: 0, ast.IsNot: 1, ast.Eq: 2, ast.NotEq: 3, ast.Lt: 4, ast.LtE: 5, ast.Gt: 6, ast.GtE: 7}
+_CMP_NAMES = ("is", "is not", "==", "!=", "<", "<=", ">", ">=")
+_CMP_FIELD = (0, 0, 1, 2, 3, 4, 5, 6)  # which field of a relation answers each operator
+_CMP_TOKEN = re.compile(r"\bis\s+not\b|\bis\b|==|!=|<=|>=|<|>")
+
+
+# The operator swaps the comparison map is used for: (old, new).
+_CMP_SWAPS = {(0, 2), (1, 3), (4, 5), (5, 4), (6, 7), (7, 6)}
+# "site": drop tests only when NO recorded test ever saw operands on which the two
+# operators disagree at that comparison (then every test that evaluated it is dropped).
+# "test": decide each test from its own recorded operands (more is dropped; it trusts that
+# a test sees the same operands whatever ran before it).
+CMP_MODE = os.environ.get("BR_CMP_MODE", "site")
+
+
+def _volatile(node: ast.AST) -> bool:
+    """Does this operand look like a hash or an object id? Such values differ between
+    processes, so what a recording saw of them says little about the next run."""
+    for n in ast.walk(node):
+        if isinstance(n, ast.Call) and isinstance(n.func, ast.Name) and n.func.id in ("hash", "id"):
+            return True
+        name = n.id if isinstance(n, ast.Name) else n.attr if isinstance(n, ast.Attribute) else None
+        if name is not None and "hash" in name.lower():
+            return True
+    return False
+
+
+def _cmp_outcome(code: int, op: int) -> int:
+    """0 False, 1 True, 2 unknown: what operator `op` gives on operands with this relation."""
+    if code >= 2187 or code < 0:
+        return 2  # the recorder's mark for "the comparison raised", or anything unexpected
+    f = (code // (3 ** _CMP_FIELD[op])) % 3
+    return 1 - f if (op == 1 and f != 2) else f
+
+
+def comparison_swaps(old: str, new: str) -> list[tuple] | None:
+    """[(line, col, end line, end col, old operator name, new operator name, old op, new op)]
+    when the two sources differ ONLY in the operator of single-operator comparisons
+    (positions are the comparison's in `old`); otherwise None."""
+    a_lines, b_lines = old.split("\n"), new.split("\n")
+    if len(a_lines) != len(b_lines):
+        return None
+    changed = [i + 1 for i, (x, y) in enumerate(zip(a_lines, b_lines)) if x != y]
+    if not changed or len(changed) > 4:
+        return None
+    for ln in changed:  # cheap filter before any parsing: only operator tokens may differ
+        if _CMP_TOKEN.sub("\0", a_lines[ln - 1]) != _CMP_TOKEN.sub("\0", b_lines[ln - 1]):
+            return None
+    try:
+        a, b = ast.parse(old), ast.parse(new)
+    except (SyntaxError, ValueError):
+        return None
+    if len(a.body) != len(b.body):
+        return None
+    found = []
+    for x_top, y_top in zip(a.body, b.body):
+        last = getattr(x_top, "end_lineno", None) or x_top.lineno
+        first = min([x_top.lineno] + [d.lineno for d in getattr(x_top, "decorator_list", ())])
+        if not any(first <= ln <= last for ln in changed):
+            continue
+        xs = [n for n in ast.walk(x_top) if isinstance(n, ast.Compare)]
+        ys = [n for n in ast.walk(y_top) if isinstance(n, ast.Compare)]
+        if len(xs) != len(ys):
+            return None
+        for x, y in zip(xs, ys):
+            if [type(o) for o in x.ops] == [type(o) for o in y.ops]:
+                continue
+            if len(x.ops) != 1 or len(y.ops) != 1:
+                return None
+            p, q = _CMP_OPS.get(type(x.ops[0])), _CMP_OPS.get(type(y.ops[0]))
+            if (p, q) not in _CMP_SWAPS:
+                # Only swaps whose two answers differ in ONE way: is/== and is not/!= differ
+                # when the operands are equal without being one object; </<= and >/>=
+                # differ when the operands are equal. Not used: a swap TOWARDS `is`
+                # (whether two equal values are one object is the compiler's and the
+                # interpreter's business: literals, small ints, interned strings), and any
+                # swap that depends on which operand is the larger one.
+                return None
+            if _volatile(x.left) or _volatile(x.comparators[0]):
+                return None  # hash() / id() values: not the same from one process to the next
+            found.append((x.lineno, x.col_offset, x.end_lineno, x.end_col_offset, _CMP_NAMES[p], _CMP_NAMES[q], p, q))
+            y.ops = x.ops
+        if ast.dump(x_top) != ast.dump(y_top):
+            return None  # something else differs as well
+    return found or None
+
+
+class CmpMap:
+    def __init__(self, path: Path, m: Map) -> None:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            raw = json.load(f)
+        if raw.get("version") != 2:
+            raise ValueError("comparison map version")
+        self.flagged: dict[str, set[str]] = {p: set(keys) for p, keys in raw.get("flagged", {}).items()}
+        index = {nodeid: i for i, nodeid in enumerate(m.tests)}
+        # recorded test -> index in the coverage map (None: a test the coverage map lacks)
+        self.to_index = [index.get(t) for t in raw["tests"]]
+        self.recorded: set[int] = {i for i in self.to_index if i is not None}
+        self.relsets: list[list[int]] = raw["relsets"]
+        self.testsets: list[list[int]] = raw["testsets"]
+        self.sites: dict[str, dict[str, list]] = raw["sites"]
+
+    def members(self, testset: int):
+        total = 0
+        for d in self.testsets[testset]:
+            total += d
+            i = self.to_index[total]
+            if i is not None:
+                yield i
+
+    def narrow(self, path: str, got: set[int], swaps: list[tuple]) -> set[int] | None:
+        """The tests of `got` that must stay; None when the map cannot say anything."""
+        by_site = self.sites.get(path)
+        if by_site is None:
+            return None
+        verdicts = []
+        flagged = self.flagged.get(path, ())
+        for line, col, end_line, end_col, _, _, old, new in swaps:
+            key = f"{line}:{col}:{end_line}:{end_col}"
+            if key in flagged:
+                return None  # the recordings disagree about this comparison: not used
+            rows = by_site.get(key)
+            if rows is None:
+                return None  # no recorded test ever evaluated it (or not a recorded kind)
+            differs: dict[int, bool] = {}
+            for relset, testset in rows:
+                d = False
+                for code in self.relsets[relset]:
+                    x, y = _cmp_outcome(code, old), _cmp_outcome(code, new)
+                    if x == 2 or y == 2 or x != y:
+                        d = True
+                        break
+                for t in self.members(testset):
+                    differs[t] = differs.get(t, False) or d
+            if CMP_MODE == "site" and any(differs.values()):
+                # Some test, somewhere, saw operands on which the two operators disagree
+                # (or that we cannot vouch for). Another test could meet the same
+                # operands when the suite runs in another order: nobody is dropped.
+                return set(got)
+            verdicts.append(differs)
+        keep = set()
+        for t in got:
+            if t not in self.recorded:
+                keep.add(t)  # no complete recording of this test
+                continue
+            for differs in verdicts:
+                d = differs.get(t)
+                if d is None or d:
+                    # no record at this comparison (we cannot show what it saw), or it
+                    # saw operands on which the two operators differ
+                    keep.add(t)
+                    break
+        return keep
+
+
 CLASSATTR = os.environ.get("BR_CLASSATTR", "1") == "1"
 CA_MAP_PATH = Path(os.environ.get("BR_CA_MAP", APP / "maps" / "attr.json.gz"))
 CA_BASE_PATH = Path(os.environ.get("BR_CA_BASE", APP / "maps" / "class_state.json"))
@@ -1562,6 +1756,12 @@ def main() -> None:
         except Exception as e:  # never a miss: without it the older class rule applies
             log(f"attribute map unavailable ({e!r})")
             selector.attrs = None
+    if selector is not None and CMPMAP and CMP_MAP_PATH.is_file() and not unmapped:
+        try:
+            selector.cmp = CmpMap(CMP_MAP_PATH, m)
+        except Exception as e:  # never a miss: without it every test that ran the statement is kept
+            log(f"comparison map unavailable ({e!r})")
+            selector.cmp = None
     early = None
     if EARLYCUT and selector is not None and SRC.is_dir() and EC_STAGE_PATH.is_file():
         try:
