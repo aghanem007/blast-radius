@@ -17,14 +17,14 @@ RUN mkdir -p /app/src \
     && tar -xzf /tmp/sqlglot.tar.gz -C /app/src --strip-components=1 \
     && rm /tmp/sqlglot.tar.gz
 
-COPY selector.py prerun.py probe.py earlycut.py classstate.py /app/
+COPY selector.py prerun.py probe.py earlycut.py classstate.py owntest.py /app/
 COPY maps/ /app/maps/
 
 # Bytecode for the pinned source (the run's disk is read-only, so it cannot be cached
 # then), and the pinned commit's fingerprints for the early-cutoff check, made by the
 # same interpreter the run uses. If the fingerprints cannot be made the build still
 # succeeds: the selector then computes them once at run time, or keeps the test.
-RUN python -m compileall -q /app/src/sqlglot /app/src/tests/__init__.py /app/src/tests/helpers.py \
+RUN python -m compileall -q /app/src/sqlglot /app/src/tests/__init__.py /app/src/tests/helpers.py /app/src/tests/test_generator.py \
     ; (PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python /app/earlycut.py baseline /app/src /app/maps/tpcds_base.json \
        || echo "early-cutoff baseline not built") \
     ; (PYTHONHASHSEED=0 PYTHONDONTWRITEBYTECODE=1 python /app/classstate.py baseline /app/src /app/maps/class_state.json \

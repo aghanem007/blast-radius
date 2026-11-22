@@ -407,6 +407,10 @@ class Selector:
         self.data_sources: dict[str, str] = {}
         self.place_calls = 0
         self._class_base: dict | None | bool = False
+        # Per patch, set by resolve_class_level when class attributes the map observes are
+        # ALL the patch changes once sqlglot is imported: those attributes' keys. The
+        # early cutoff uses it (EarlyCut.plan).
+        self.import_keys: set[str] | None = None
 
     def source(self, path: str) -> str | None:
         if path not in self.src_cache:
@@ -424,6 +428,7 @@ class Selector:
         self.place_calls = 0
         self.changed_paths = []
         self.data_sources = {}
+        self.import_keys = None
         files = parse_patch(patch_text)
         if not files:
             log("  no files in patch -> all")
@@ -559,6 +564,10 @@ class Selector:
             log(f"  class attributes {sorted(edited)[:3]}: changes state nothing here can observe ({unseen[:3]}) -> all")
             return ALL
         module_tables = any("::" in k for k in changed)
+        if not extra and attr_keys == changed and all("::" not in k for k in edited):
+            # Nothing but observed class attributes differs after import (no function, no
+            # module global, no def header): whoever is affected must READ one of these.
+            self.import_keys = set(attr_keys) | set(edited)
         # Every edit inside a lambda of a table: the tests that ran those lambdas' lines.
         callers: set[int] | None = None
         if all(c is not None for _, _, _, c in self.class_spots):
@@ -596,7 +605,7 @@ class Selector:
     # ---- data files (fixtures, docs, config)
     def data_file(self, path: str, fp: FilePatch) -> set[int]:
         out: set[int] = set()
-        if path == TPCDS_FIXTURE_PATH and not fp.binary and fp.old_path == fp.new_path:
+        if path in (TPCDS_FIXTURE_PATH, TPCH_FIXTURE_PATH) and not fp.binary and fp.old_path == fp.new_path:
             old = self.source(path)
             if old is not None:
                 try:
@@ -1331,6 +1340,7 @@ EC_PLAN_DIFF_SHARE = float(os.environ.get("BR_EC_PLAN_DIFF_SHARE", "0.6"))  # ..
 # An edit to the TPC-DS fixture file itself: re-run the front half on the patched fixture.
 EC_FIXTURE = os.environ.get("BR_EC_FIXTURE", "1") == "1"
 TPCDS_FIXTURE_PATH = "tests/fixtures/optimizer/tpc-ds/tpc-ds.sql"
+TPCH_FIXTURE_PATH = "tests/fixtures/optimizer/tpc-h/tpc-h.sql"
 EC_STAGE_PATH = Path(os.environ.get("BR_EC_STAGE", APP / "maps" / "tpcds_stage.json.gz"))
 EC_BASE_PATH = Path(os.environ.get("BR_EC_BASE", APP / "maps" / "tpcds_base.json"))
 # The whole batch has 180 s of wall time (270 s in the final). Every check, including
@@ -1358,6 +1368,24 @@ EC_GAIN_MARGIN_S = 1.0
 EC_FRONT_REF_S = 4.3
 EC_SETUP_REF_S = 1.0
 EC_BACK_REF_S = 11.3
+# Import-time changes. A patch that only changes class attributes (settings, tables)
+# acts through the state sqlglot has after import. The test's front half is re-run on
+# the patched code as for any front-half change; that decides the test when the REST of
+# the test (building the fixture tables, the executor) never reads a changed attribute:
+# same inputs, same data, same behaviour. Which attributes the rest reads is recorded
+# at the pinned commit (tools/build_map/record_back_attrs.py -> maps/tpcds_back_attrs.json.gz).
+EC_IMPORT = os.environ.get("BR_EC_IMPORT", "1") == "1"
+EC_BACK_ATTRS_PATH = Path(os.environ.get("BR_EC_BACK_ATTRS", APP / "maps" / "tpcds_back_attrs.json.gz"))
+
+
+class BackAttrs:
+    def __init__(self, path: Path, version: int) -> None:
+        with gzip.open(path, "rt", encoding="utf-8") as f:
+            raw = json.load(f)
+        if raw.get("version") != version:
+            raise ValueError(f"made for early-cutoff version {raw.get('version')}, not {version}")
+        self.keys = set(raw["keys"])  # read outside the front half
+        self.wrapped = set(raw["wrapped"])  # every attribute the recording could see
 
 
 class EarlyCut:
@@ -1376,6 +1404,12 @@ class EarlyCut:
         self.slow = 1.0
         self.tried_base = False
         self.started = _wall()
+        self.back_attrs: BackAttrs | None = None
+        if EC_IMPORT and EC_BACK_ATTRS_PATH.is_file():
+            try:
+                self.back_attrs = BackAttrs(EC_BACK_ATTRS_PATH, earlycut.VERSION)
+            except Exception as e:  # never a miss: import-time changes then keep the test
+                log(f"early cutoff: no map of the executor half's attribute reads ({e!r})")
 
     def baseline(self) -> str | None:
         if not self.tried_base:
@@ -1418,6 +1452,18 @@ class EarlyCut:
             # Only the TPC-DS fixture changed: the front half is re-run on the patched
             # fixture with the pinned code. Nothing in the back half reads that file.
             return True, set()
+        keys = selector.import_keys
+        if (
+            self.back_attrs is not None and keys and not selector.runtime_spots and selector.new_sources
+            and all(p.startswith("sqlglot/") and p.endswith(".py") for p in selector.changed_paths)
+            and all(selector.file_kinds.get(p) == {"deferred"} for p in selector.new_sources)
+        ):
+            # Only class attributes change, in sqlglot only. If the map saw all of them and
+            # the test reads none outside its front half, the front half decides it.
+            if keys <= self.back_attrs.wrapped and not (keys & self.back_attrs.keys):
+                log(f"  early cutoff: {len(keys)} class attributes changed, none read outside the test's front half")
+                return True, set()
+            return None
         if not selector.prerun_ok or not selector.runtime_spots or not selector.new_sources:
             return None
         front, queries = False, set()
@@ -1507,6 +1553,120 @@ def _wall() -> float:
     return time.monotonic()
 
 
+# ------------------------------------------------- the two TPC query files
+#
+# TestExecutor.setUpClass loads BOTH tests/fixtures/optimizer/tpc-h/tpc-h.sql and
+# .../tpc-ds/tpc-ds.sql, so the read map credits every one of the class's 60 tests with
+# both files (25.5 s, test_execute_tpcds included). But after setUpClass the two
+# benchmarks never meet: test_execute_tpcds uses tpcds_sqls / tpcds_tables / tpcds_conn
+# only, test_execute_tpch and test_optimized_tpch the tpch ones (tests/test_executor.py,
+# pinned commit). The one thing they share is a cache of DuckDB results keyed by the
+# query text. So for a patch that changes only one of the two files, the tests of the
+# OTHER benchmark cannot change outcome, provided (1) the patched file still loads, as
+# setUpClass loads it (if it raises, every test of the class fails), and (2) no query of
+# the patched file has the text of a query of the other file (the shared cache).
+TPC_FIXTURES = os.environ.get("BR_TPC_FIXTURES", "1") == "1"
+
+
+def fixture_pairs(text: str) -> list[tuple[dict, str, str]]:
+    """tests/helpers.py load_sql_fixture_pairs, statement for statement, on a text.
+    Raises exactly where the original raises."""
+    statements = "\n".join([line for line in text.splitlines() if line and not line.startswith("--")]).split(";")
+    out = []
+    size = len(statements)
+    for i in range(0, size, 2):
+        if i + 1 < size:
+            sql = statements[i].strip()
+            meta = {}
+            sql_lines = sql.split("\n")
+            j = 0
+            while sql_lines[j].startswith("#"):
+                key, val = sql_lines[j].split(":", maxsplit=1)
+                meta[key.lstrip("#").strip()] = val.strip()
+                j += 1
+            sql = "\n".join(sql_lines[j:])
+            out.append((meta, sql, statements[i + 1].strip()))
+    return out
+
+
+class TpcFixtures:
+    def __init__(self, tests: list[dict]) -> None:
+        number = {t["id"]: t["number"] for t in tests}
+        ex = "tests/test_executor.py::TestExecutor::"
+        self.of_tpcds = {number[ex + n] for n in ("test_execute_tpcds",) if ex + n in number}
+        self.of_tpch = {number[ex + n] for n in ("test_execute_tpch", "test_optimized_tpch") if ex + n in number}
+
+    def apply(self, selector: "Selector", numbers: list[int]) -> list[int]:
+        if len(selector.changed_paths) != 1:
+            return numbers
+        path = selector.changed_paths[0]
+        if path == TPCH_FIXTURE_PATH:
+            other_path, drop = TPCDS_FIXTURE_PATH, self.of_tpcds
+        elif path == TPCDS_FIXTURE_PATH:
+            other_path, drop = TPCH_FIXTURE_PATH, self.of_tpch
+        else:
+            return numbers
+        drop = drop & set(numbers)
+        new, old, other = selector.data_sources.get(path), selector.source(path), selector.source(other_path)
+        if not drop or new is None or old is None or other is None:
+            return numbers
+        if "\ufffd" in new and "\ufffd" not in old:
+            log(f"  {path}: the patch may not be valid UTF-8; every executor test stays")
+            return numbers
+        try:
+            mine, theirs = fixture_pairs(new), fixture_pairs(other)
+        except Exception as e:  # noqa: BLE001 - setUpClass would raise the same way
+            log(f"  {path}: the patched file no longer loads ({type(e).__name__}); every executor test stays")
+            return numbers
+        if {sql for _, sql, _ in mine} & {sql for _, sql, _ in theirs}:
+            log(f"  {path}: shares a query text with the other benchmark (one result cache); every executor test stays")
+            return numbers
+        log(f"  {path}: still loads; the other benchmark's {len(drop)} executor tests never use it -> dropped")
+        return [n for n in numbers if n not in drop]
+
+
+# ---------------------------------- test_generator_memory, run here (owntest.py)
+OWN_GENMEM = os.environ.get("BR_OWN_GENMEM", "1") == "1"
+OWN_GENMEM_REF_S = 1.4  # CPU of the real test in a fresh process (idle machine, scorer's image and limits)
+OWN_GAIN_MARGIN_S = 0.5
+
+
+class OwnRun:
+    def __init__(self, tests: list[dict]) -> None:
+        import owntest
+
+        self.mod = owntest
+        self.src = str(SRC.resolve())
+        self.number = next((t["number"] for t in tests if t["id"] == owntest.GENERATOR_MEMORY_ID), None)
+
+    def apply(self, selector: "Selector", numbers: list[int], ms: dict[int, int]) -> list[int]:
+        if self.number is None or self.number not in numbers:
+            return numbers
+        paths = selector.changed_paths
+        if not paths or not selector.new_sources or any(not (p.startswith("sqlglot/") and p.endswith(".py")) for p in paths):
+            return numbers  # a test file, fixture or data file changed too: not the pinned test any more
+        without = [n for n in numbers if n != self.number]
+        saving = (commit_cost_ms(numbers, ms) - commit_cost_ms(without, ms)) / 1000
+        cost = OWN_GENMEM_REF_S
+        if saving < EC_GAIN_FACTOR * cost + OWN_GAIN_MARGIN_S:
+            log(f"  own run: not worth it for test_generator_memory (saves {saving:.1f}s, costs ~{cost:.1f}s)")
+            return numbers
+        cutoff = min(EC_DEADLINE_S, CA_DEADLINE_S - 5.0 - CA_RESERVE_PER_COMMIT_S * _COMMITS_LEFT)
+        remaining = cutoff - (_wall() - _STARTED)
+        wall_limit = min(5 + 6 * cost, remaining)
+        if wall_limit < 3 + 3 * cost:
+            log(f"  own run: out of time budget ({remaining:.0f}s left)")
+            return numbers
+        # CPU cap: about five times a normal run, so a slower machine still finishes and a
+        # patch that makes the test crawl costs a few seconds at most (then it stays scheduled).
+        verdict = self.mod.run(self.src, self.mod.GENERATOR_MEMORY_NAME, dict(selector.new_sources), wall_limit, 2 + 4 * cost, log)
+        if verdict is None or not verdict.get("ok") or not verdict.get("passed"):
+            log(f"  own run: test_generator_memory does not pass here ({json.dumps(verdict)[:200]}) -> stays scheduled")
+            return numbers
+        log(f"  own run: test_generator_memory passes on the patched code (cpu {verdict.get('cpu_s')}s) -> not scheduled (saves {saving:.1f}s)")
+        return without
+
+
 # --------------------------------------------------------------------------- main
 
 
@@ -1568,6 +1728,13 @@ def main() -> None:
             early = EarlyCut(tests)
         except Exception as e:  # never a miss: without it every candidate is kept
             log(f"early cutoff unavailable ({e!r})")
+    fixtures = TpcFixtures(tests) if TPC_FIXTURES and selector is not None else None
+    own = None
+    if OWN_GENMEM and selector is not None and SRC.is_dir():
+        try:
+            own = OwnRun(tests)
+        except Exception as e:  # never a miss: without it the test is scheduled
+            log(f"own run unavailable ({e!r})")
 
     global _COMMITS_LEFT
     patches = sorted((DATA / "commits").glob("*.patch"))
@@ -1592,11 +1759,21 @@ def main() -> None:
                     numbers = try_prerun(runner, selector, numbers, ms, nodeid_of)
                 except Exception as e:  # never a miss: keep the full selection
                     log(f"  prerun error {e!r}; keeping all candidates")
+            if fixtures is not None and numbers and not unmapped:
+                try:
+                    numbers = fixtures.apply(selector, numbers)
+                except Exception as e:  # never a miss: keep the full selection
+                    log(f"  TPC fixture rule error {e!r}; keeping all candidates")
             if early is not None and numbers and not unmapped:
                 try:
                     numbers = early.apply(selector, numbers, ms)
                 except Exception as e:  # never a miss: keep the full selection
                     log(f"  early cutoff error {e!r}; keeping all candidates")
+            if own is not None and numbers and not unmapped:
+                try:
+                    numbers = own.apply(selector, numbers, ms)
+                except Exception as e:  # never a miss: keep the full selection
+                    log(f"  own run error {e!r}; keeping all candidates")
         workers = best_split([(n, ms[n]) for n in numbers])
         log(f"  -> {len(numbers)} tests on {len(workers)} workers")
         answers.write(json.dumps({"commit": patch.stem, "workers": workers}) + "\n")
